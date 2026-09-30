@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+coverage.json
+htmlcov/
+test-results/
+
+# Tooling
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+.DS_Store
+
+# Local credentials: never committed (ADR 0007)
+.env
+*.token.json
+credentials/

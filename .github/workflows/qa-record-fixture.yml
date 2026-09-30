@@ -1,0 +1,54 @@
+name: Record live fixture
+
+# Records one upstream fixture on the self-hosted runner and commits it to the branch this was
+# dispatched against (docs/live-qa.md). /qa-record dispatches it from a session that has no
+# credentials. Dispatch only; refuses main and releases/*.
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: 'Check to record (a key of CHECKS in scripts/live_check.py)'
+        required: true
+        type: string
+
+permissions:
+  contents: write   # to commit the recorded fixture back to the branch
+
+concurrency:
+  group: live-check
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: [self-hosted, html-artifact-deploy-qa]
+    timeout-minutes: 20
+    env:
+      CHECK_NAME: ${{ inputs.name }}   # through the environment, so the input cannot inject shell
+    steps:
+      - name: Refuse a protected branch
+        run: |
+          if [ "${GITHUB_REF_NAME}" = "main" ] || [[ "${GITHUB_REF_NAME}" == releases/* ]]; then
+            echo "::error::This commits to the branch it runs on. Dispatch it against a feature branch."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Build this run's venv
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -e ".[test]"
+      - name: Record the fixture
+        run: .venv/bin/python scripts/live_check.py --record "$CHECK_NAME"
+      - name: Commit and push the fixture
+        run: |
+          git add -- 'tests/fixtures/live/**'
+          if git diff --cached --quiet; then
+            echo "No fixture change for $CHECK_NAME."
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "Record live $CHECK_NAME fixture" \
+                     -m "Recorded by qa-record-fixture.yml on the QA runner. Review the diff for real identifiers before merging (docs/live-qa.md)."
+          git push origin "HEAD:${GITHUB_REF_NAME}"
