@@ -1,0 +1,125 @@
+name: Tests
+
+# Layers 1-3 of docs/testing-policy.md, on every PR. A 100% pass rate is required to merge. Job
+# names here are what scripts/update_branch_protection.py's REQUIRED_STATUS_CHECKS lists; rename
+# one and update that list in the same PR.
+on:
+  push:
+    branches: [main, "releases/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # full history + tags: setuptools_scm needs them (ADR 0004)
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+
+      - name: Install
+        run: pip install -e ".[test]"
+
+      - name: Run test suite (100% pass rate required)
+        run: |
+          pytest -v --cov=src/html_artifact_deploy --cov-branch \
+            --cov-report=term-missing \
+            --cov-report=json:coverage.json \
+            --cov-report=html:htmlcov
+
+      # The gate: overall coverage and each listed module's floor (scripts/check_coverage_floor.py).
+      - name: Enforce coverage floor
+        run: python scripts/check_coverage_floor.py coverage.json
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-report
+          path: |
+            coverage.json
+            htmlcov/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # Every other Python version requires-python claims, one check each. Coverage is the `test`
+  # job's to own; repeating it per version would only cost time.
+  test-python-compat:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.14']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: pip install -e ".[test]"
+      - name: Run test suite (100% pass rate required)
+        run: pytest -v
+
+  # Windows and macOS: path handling and subprocess/stdio behavior differ there. Not in
+  # REQUIRED_STATUS_CHECKS by default (macOS minutes are expensive on private repos); add
+  # "Test (windows-latest)" and "Test (macos-latest)" there once the server supports those OSes.
+  platform:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Install
+        run: pip install -e ".[test]"
+      - name: Run test suite (100% pass rate required)
+        run: pytest -v
+
+  # Its own job so a lint failure is reported on its own line in the checks list.
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Install
+        run: pip install -e ".[test,lint]"
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Format (ruff)
+        run: ruff format --check .
+
+      # Informational: visible as a failed step without failing the job. The ratchet is the next
+      # step, over the modules pyproject.toml promotes.
+      - name: Type-check (mypy, informational)
+        continue-on-error: true
+        run: mypy src/html_artifact_deploy
+
+      - name: Type-check promoted modules (mypy, blocking)
+        run: python scripts/mypy_strict_modules.py
+
+      # A genuine false positive is annotated `# nosec BXXX  # <reason>` at its call site.
+      - name: Security lint (bandit)
+        run: bandit -q -c pyproject.toml -r src

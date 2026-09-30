@@ -1,0 +1,42 @@
+name: Live upstream check
+
+# Layer 5 of docs/testing-policy.md: does the real upstream service still answer in the shape the
+# committed fixtures record? Runs only on the self-hosted runner that holds the QA credentials, and
+# never on pull_request, so no pull request's code runs where the credentials are (ADR 0007).
+#
+# Until that runner exists (docs/live-qa.md), the schedule stays commented out: a job for a runner
+# label nobody serves queues for a day and then fails.
+on:
+  # schedule:
+  #   - cron: '0 6 * * 1'   # Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-check     # shared with qa-record-fixture.yml: both refresh the same credential files
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: [self-hosted, html-artifact-deploy-qa]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Build this run's venv
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -e ".[test]"
+      - name: Check every registered upstream endpoint
+        run: .venv/bin/python scripts/live_check.py --check | tee live-check-report.txt
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: live-check-report
+          path: live-check-report.txt
+          if-no-files-found: ignore
+          retention-days: 90
