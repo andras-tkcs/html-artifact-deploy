@@ -36,11 +36,21 @@ The repository is the MCP server template, renamed:
   whole suite at 100% line and branch coverage**, or the `test` job fails.
 - `pyproject.toml`: the only runtime dependency is `mcp>=2.2,<3.0.0`. Installed: `mcp 2.2.0`, which
   brings `starlette 1.7`, `uvicorn 0.54`, `httpx2 2.13` (import name `httpx2`, with
-  `httpx2.ASGITransport`), `pyjwt`, `python-multipart`. `httpx` (without the 2) is **not**
-  installed, so `starlette.testclient` cannot be used; use `httpx2.AsyncClient(transport=
-  httpx2.ASGITransport(app=app), base_url="http://testserver")` for route tests.
+  `httpx2.ASGITransport`), `pyjwt`, `python-multipart`. Route tests use
+  `httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url=<http.public_url>)` inside
+  `async with app.router.lifespan_context(app):` (the MCP session manager starts in the lifespan);
+  nothing else.
 - mypy strict ratchet: one `[[tool.mypy.overrides]]` block for `html_artifact_deploy.server`.
-- ADRs 0001–0009 exist; the next free number is **0010**.
+  `scripts/mypy_strict_modules.py` refuses wildcards and refuses a listed module whose file does
+  not exist, so modules are promoted by name, in a phase that runs after the module exists (D1).
+- `scripts/check_coverage_floor.py:33`: `MODULE_FLOORS` lists `server.py` at 100; its docstring asks
+  for security-critical modules to be listed too.
+- `bandit` flags string constants whose names contain `TOKEN`, `SECRET` or `PASSWORD` (B105) and
+  `token_type="Bearer"` keyword arguments (B106); each such site gets
+  `# nosec B105  # <what the string is>` or `# nosec B106  # <reason>`.
+- ADRs 0001–0010 exist. ADR 0010 makes Linux the only supported OS (`tests.yml` and `build.yml` run on
+  Linux only), so POSIX file modes may be asserted without platform skips. The next free number is
+  **0011**.
 
 What the MCP SDK 2.2 provides and the design relies on (read these files in
 `.venv/lib/python3.11/site-packages/mcp/`):
@@ -75,7 +85,7 @@ One Python package, one process per deployment, two transports built from one fa
 | `page_index.py` | `PageIndex`, `PageRecord`: who published which page (D6) |
 | `service.py` | `PageService`: publish, list, unpublish; `PageError` (D7) |
 | `server.py` | `AppContext`, `build_server()`: the MCP tools (D8) |
-| `google_oidc.py` | `GoogleOidcClient`, `GoogleIdentity`, `GoogleOidcClientError` (D9) |
+| `google_oidc_client.py` | `GoogleOidcClient`, `GoogleIdentity`, `GoogleOidcClientError` (D9) |
 | `token_store.py` | `TokenStore`: OAuth clients, pending sign-ins, codes, tokens, API tokens (D10) |
 | `oauth_provider.py` | `GoogleOAuthProvider`: the OAuth 2.1 authorization server (D10) |
 | `uploads.py` | `UploadStore`, `UploadError`: one-time upload URLs (D12) |
@@ -83,8 +93,18 @@ One Python package, one process per deployment, two transports built from one fa
 | `__main__.py` | The command line: stdio (default), `serve-http`, `check-config`, `token …` (D13) |
 
 No module holds module-level mutable state; every store is an instance built by `__main__` or
-`build_http_app`, so `tests/conftest.py` stays unchanged. Every module is promoted to the strict
-mypy ratchet from its first commit (p1 widens the override to `html_artifact_deploy.*`).
+`build_http_app`, so `tests/conftest.py` stays unchanged.
+
+Every new module must pass `mypy --strict` from its first commit (each phase's acceptance runs
+it on its own files). Promotion into the blocking ratchet happens by name in sequential phases,
+turning the existing block's `module = "html_artifact_deploy.server"` into a list:
+p3 adds `config`, `pages`, `storage`, `state`, `page_index`, `service`; p6 adds
+`google_oidc_client`, `token_store`, `oauth_provider`, `http_app`, `__main__`; p7 adds `uploads`.
+Coverage floors at 100 (`MODULE_FLOORS` in `scripts/check_coverage_floor.py`, with a one-line
+comment each) are added in the same phases for `config.py`, `storage.py` (p3), `token_store.py`,
+`oauth_provider.py`, `http_app.py` (p6) and `uploads.py` (p7).
+
+`CHANGELOG.md` is written only by p9; no other phase edits it.
 
 Blocking work (SQLite, file I/O, the Google HTTP call) is synchronous inside its module and called
 from `async def` code through `asyncio.to_thread(...)` (coding guidelines, "Async and
@@ -144,7 +164,7 @@ class HttpConfig:
 @dataclass(frozen=True)
 class AuthConfig:
     google_client_id: str
-    google_client_secret: str   # the value read from the environment, never from the file
+    google_client_secret_env: str = DEFAULT_SECRET_ENV   # the NAME of the variable holding the secret
     allowed_domains: tuple[str, ...]
     allowed_emails: tuple[str, ...]
     redirect_uri_allowlist: tuple[str, ...] = DEFAULT_REDIRECT_URI_ALLOWLIST
@@ -160,13 +180,14 @@ class Config:
 
 DEFAULT_MAX_BYTES = 16_000_000      # the size limit of a claude.ai artifact
 MAX_MAX_BYTES = 50_000_000
-DEFAULT_SECRET_ENV = "HTML_ARTIFACT_DEPLOY_GOOGLE_CLIENT_SECRET"
+DEFAULT_SECRET_ENV = "HTML_ARTIFACT_DEPLOY_GOOGLE_CLIENT_SECRET"  # nosec B105  # a variable name, not a secret
 DEFAULT_REDIRECT_URI_ALLOWLIST = ("https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback")
 
 def resolve_config_path(cli_value: str | None, environ: Mapping[str, str]) -> Path: ...
 def load_config(path: Path, environ: Mapping[str, str]) -> Config: ...
 def require_http(config: Config) -> tuple[HttpConfig, AuthConfig]: ...
 def is_allowed_email(auth: AuthConfig, email: str, hosted_domain: str | None) -> bool: ...
+def google_client_secret(auth: AuthConfig, environ: Mapping[str, str]) -> str: ...
 ```
 
 `load_config` raises `ConfigError(f"{path}: {message}")` for every problem, checked in this
@@ -192,11 +213,17 @@ trailing `/` is stripped. Allowed-email and domain values are lowercased on load
 | `pages.public_base_url` and `http.public_url` share a host name (compare `urlsplit(...).hostname`) | `pages.public_base_url must be on a different host name from http.public_url: a published page runs its own scripts, and must not share an origin with this server` |
 | `auth.google_client_id` missing or not ending in `.apps.googleusercontent.com` | `auth.google_client_id must be the Client ID of a Google OAuth client, ending in .apps.googleusercontent.com` |
 | `auth.google_client_secret_env` present and not matching `^[A-Z_][A-Z0-9_]*$` | `auth.google_client_secret_env must be the name of an environment variable, for example HTML_ARTIFACT_DEPLOY_GOOGLE_CLIENT_SECRET` |
-| that environment variable unset or empty | `the environment variable {name} is empty; it must hold the Google OAuth client secret` |
 | `auth.allowed_domains` / `auth.allowed_emails` not a list of non-empty strings | `auth.{key} must be a list of strings` |
 | both lists empty | `auth.allowed_domains or auth.allowed_emails must name who may sign in` |
 | an `allowed_emails` entry without exactly one `@` | `auth.allowed_emails entry {value!r} is not an e-mail address` |
 | `auth.redirect_uri_allowlist` present and not a list of `https://` URLs (plain `urlsplit` scheme check) | `auth.redirect_uri_allowlist must be a list of https:// redirect URIs` |
+
+The secret itself is not read by `load_config`, so stdio, `check-config` without the
+variable, and the `token` commands work without it. `google_client_secret(auth, environ)` returns
+`environ[auth.google_client_secret_env]`, or raises
+`ConfigError(f"the environment variable {name} is empty; it must hold the Google OAuth client secret")`
+if it is unset or empty. `serve-http` calls it before building the app, and `check-config` calls
+it when `[auth]` is present.
 
 Unknown keys are errors, not ignored: a typo in a security setting must not be silently
 dropped. `load_config` never touches `pages.root` or `state.dir` on disk; `LocalFolderStore` and
@@ -206,10 +233,11 @@ dropped. `load_config` never touches `pages.root` or `state.dir` on disk; `Local
 `ConfigError(f"{config.path}: serve-http needs the [http] and [auth] sections")` if either is
 `None`.
 
-`is_allowed_email(auth, email, hosted_domain)`: `email = email.lower()`; `True` if
-`email in auth.allowed_emails`, or if `hosted_domain` is not `None`, `hosted_domain.lower() in
-auth.allowed_domains` and `email.endswith("@" + hosted_domain.lower())`. For API tokens (D13),
-which have no Google `hd` claim, the caller passes `hosted_domain = email.rpartition("@")[2]`.
+`is_allowed_email(auth, email, hosted_domain)`: `True` if `email.lower() in auth.allowed_emails`,
+or if `hosted_domain` is not `None` and `hosted_domain.lower() in auth.allowed_domains`. Google
+sets `hd` only for accounts managed by that Workspace, and to the primary domain even for users on
+a secondary domain, so `hd` alone decides; the e-mail's own domain is not compared. For API tokens
+(D13), which have no Google `hd` claim, the caller passes `hosted_domain = email.rpartition("@")[2]`.
 
 ### D3. Ids, slugs, links: `pages.py`
 
@@ -280,6 +308,7 @@ class StateDB:
     def close(self) -> None: ...
 ```
 
+- `close()` closes the connection (tests call it directly).
 - `__init__` creates the parent folder (`mkdir(parents=True, exist_ok=True, mode=0o700)`),
   connects with `sqlite3.connect(path, check_same_thread=False, isolation_level=None)`, sets
   `PRAGMA journal_mode=WAL` and `PRAGMA foreign_keys=ON`, then reads `PRAGMA user_version`: `0`
@@ -300,17 +329,20 @@ CREATE INDEX pages_by_owner ON pages(owner, updated_at);
 CREATE TABLE oauth_clients (client_id TEXT PRIMARY KEY, info_json TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE auth_requests (
   state_hash TEXT PRIMARY KEY, client_id TEXT NOT NULL, params_json TEXT NOT NULL,
-  nonce TEXT NOT NULL, expires_at INTEGER NOT NULL);
+  nonce TEXT NOT NULL, binding_hash TEXT, expires_at INTEGER NOT NULL);
 CREATE TABLE auth_codes (
-  code_hash TEXT PRIMARY KEY, client_id TEXT NOT NULL, code_json TEXT NOT NULL, expires_at INTEGER NOT NULL);
+  code_hash TEXT PRIMARY KEY, client_id TEXT NOT NULL, code_json TEXT NOT NULL,
+  hosted_domain TEXT, family TEXT, used_at INTEGER, expires_at INTEGER NOT NULL);
 CREATE TABLE tokens (
   token_hash TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('access', 'refresh', 'api')),
-  client_id TEXT NOT NULL, subject TEXT NOT NULL, scopes TEXT NOT NULL, resource TEXT,
-  family TEXT, name TEXT, expires_at INTEGER, created_at INTEGER NOT NULL);
+  client_id TEXT NOT NULL, subject TEXT NOT NULL, hosted_domain TEXT, scopes TEXT NOT NULL,
+  resource TEXT, family TEXT, name TEXT, used_at INTEGER, expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL);
 CREATE UNIQUE INDEX api_token_names ON tokens(subject, name) WHERE kind = 'api';
 CREATE TABLE uploads (
   upload_hash TEXT PRIMARY KEY, owner TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('open', 'filled')),
   bytes INTEGER, expires_at INTEGER NOT NULL);
+CREATE INDEX uploads_by_owner ON uploads(owner, state);
 ```
 
 Secrets (tokens, codes, `state` values, upload ids) are stored only as
@@ -479,11 +511,11 @@ annotations `ToolAnnotations(title="Create page upload URL", readOnlyHint=False,
 > Only useful when you can make HTTP requests or run commands (for example in Claude Code); otherwise
 > pass the page to publish_page as html.
 
-### D9. Google sign-in client: `google_oidc.py`
+### D9. Google sign-in client: `google_oidc_client.py`
 
 ```python
 GOOGLE_AUTHORIZATION_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
-GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"  # nosec B105  # a public URL
 GOOGLE_ISSUERS = ("https://accounts.google.com", "accounts.google.com")
 TIMEOUT_SECONDS = 10
 
@@ -516,8 +548,9 @@ class GoogleOidcClient:
   directly from the token endpoint over TLS, which is the only way this client gets one. Checks:
   `iss in GOOGLE_ISSUERS`; `aud == client_id`; `exp > clock()`; `nonce == nonce`; `email` is a
   non-empty string; `email_verified is True`.
-- Every failure (`urllib.error.URLError`, `OSError`, `TimeoutError`, non-JSON, missing
-  `id_token`, a failed check) is logged with `logger.warning("Google sign-in failed: %s", reason)`
+- Every failure (one `except OSError` clause covers `urllib.error.URLError`, `TimeoutError` and
+  socket errors, which all subclass it; a `ValueError` from non-JSON or bad base64; a missing
+  `id_token`; a failed check) is logged with `logger.warning("Google sign-in failed: %s", reason)`
   (`reason` is a short fixed description such as `"nonce mismatch"` or the exception's class name,
   never a token or code) and raised as `GoogleOidcClientError("Google sign-in failed.")`.
 
@@ -532,92 +565,139 @@ Live check (layer 5, needs no credentials): `scripts/live_check.py` gains
 ### D10. OAuth authorization server: `token_store.py`, `oauth_provider.py`
 
 The server is its own OAuth 2.1 authorization server, as the MCP authorization spec expects and
-claude.ai requires (dynamic client registration, PKCE, metadata, all served by the SDK's
-`create_auth_routes`). It never issues Google's tokens to clients: Google only proves who the
-person is, and this server issues its own opaque tokens.
+claude.ai requires (dynamic client registration, PKCE, metadata, all served by the SDK's auth
+routes: `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`,
+`/register`, `/authorize`, `/token`, `/revoke`). It never hands Google's tokens to clients: Google
+only proves who the person is, and this server issues its own opaque tokens.
 
-Token formats: `hda_` + `secrets.token_urlsafe(32)` (access), `hdr_` + … (refresh), `hdk_` + …
-(API token), authorization codes and `state` values are `secrets.token_urlsafe(32)`. Lifetimes:
-`ACCESS_TOKEN_TTL = 3600`, `REFRESH_TOKEN_TTL = 30 * 86400`, `AUTH_CODE_TTL = 300`,
-`AUTH_REQUEST_TTL = 600`. Scope: the single scope `"pages"` (`SCOPE = "pages"`).
-`API_TOKEN_CLIENT_ID = "api-token"`.
+Constants (`oauth_provider.py` unless noted): token prefixes `ACCESS_PREFIX = "hda_"`,
+`REFRESH_PREFIX = "hdr_"`, `API_PREFIX = "hdk_"` (`token_store.py`; each `# nosec B105  # a token
+prefix, not a secret`), each followed by `secrets.token_urlsafe(32)`; authorization codes,
+`state` values and sign-in binding values are `secrets.token_urlsafe(32)`. Lifetimes:
+`ACCESS_TOKEN_TTL = 3600`, `REFRESH_TOKEN_TTL = 30 * 86400` (absolute: a rotated refresh token
+keeps the expiry of the one it replaces, so a person signs in with Google at least every 30 days),
+`AUTH_CODE_TTL = 300`, `AUTH_REQUEST_TTL = 600`. Scope: the single scope `SCOPE = "pages"`.
+`API_TOKEN_CLIENT_ID = "api-token"` (`# nosec B105  # a client id label`).
+`MAX_PENDING_SIGN_INS = 1000`. `BINDING_COOKIE = "__Host-hda_signin"` when `http.public_url` is
+https, else `"hda_signin"` (tests on `http://127.0.0.1`).
 
-`TokenStore(db: StateDB, *, clock=time.time)`, all methods synchronous:
+`TokenStore(db: StateDB, *, clock=time.time)`, all methods synchronous. Every stored secret is a
+`secret_hash`; `expires_at <= now` means absent.
 
 ```python
 def save_client(self, info: OAuthClientInformationFull) -> None
 def get_client(self, client_id: str) -> OAuthClientInformationFull | None
+def count_pending_sign_ins(self) -> int
 def save_auth_request(self, state: str, client_id: str, params: AuthorizationParams, nonce: str) -> None
-def pop_auth_request(self, state: str) -> tuple[str, AuthorizationParams, str] | None   # (client_id, params, nonce); deletes; None if absent or expired
-def save_code(self, code: AuthorizationCode) -> None
-def get_code(self, client_id: str, code: str) -> AuthorizationCode | None               # None if absent, other client, or expired
-def consume_code(self, code: str) -> bool                                               # DELETE; True if a row was deleted
-def issue(self, kind: Literal["access", "refresh"], client_id: str, subject: str, scopes: list[str], resource: str | None, family: str) -> tuple[str, int]  # (token, expires_at)
-def get_token(self, token: str, kinds: tuple[str, ...]) -> sqlite3.Row | None           # None if absent or expired
-def delete_token(self, token: str) -> bool
-def revoke_family(self, family: str) -> None
-def create_api_token(self, subject: str, name: str, days: int) -> str                   # sqlite3.IntegrityError on a duplicate name -> ValueError(f"{subject} already has an API token named {name!r}.")
-def list_api_tokens(self) -> list[tuple[str, str, int | None, int]]                     # (subject, name, expires_at, created_at)
+def get_auth_request(self, state: str) -> tuple[str, AuthorizationParams, str, str | None] | None   # as pop_auth_request, without deleting
+def bind_auth_request(self, state: str, binding: str) -> bool                  # sets binding_hash once; False if absent, expired or already bound
+def pop_auth_request(self, state: str) -> tuple[str, AuthorizationParams, str, str | None] | None
+    # (client_id, params, nonce, binding_hash); deletes the row; None if absent or expired
+def save_code(self, code: AuthorizationCode, hosted_domain: str | None) -> None
+def get_code(self, client_id: str, code: str) -> tuple[AuthorizationCode, str | None, str | None] | None
+    # (code, hosted_domain, used_family): None if absent, other client or expired; used_family is the
+    # family issued from it if it was already exchanged, else None
+def mark_code_used(self, code: str, family: str) -> bool                        # UPDATE ... WHERE used_at IS NULL; True if this call marked it
+def issue(self, kind: Literal["access", "refresh"], client_id: str, subject: str, hosted_domain: str | None,
+          scopes: list[str], resource: str | None, family: str, expires_at: int) -> str
+def get_token(self, token: str, kinds: tuple[str, ...]) -> sqlite3.Row | None   # None if absent or expired (used rows ARE returned)
+def mark_used(self, token: str) -> bool                                         # UPDATE ... WHERE used_at IS NULL; True if this call marked it
+def revoke_family(self, family: str) -> None                                    # deletes every token row of the family
+def create_api_token(self, subject: str, name: str, days: int) -> str
+    # subject lowercased; kind 'api', client_id API_TOKEN_CLIENT_ID, scopes "pages", resource NULL,
+    # hosted_domain = subject's domain, expires_at = now + days*86400;
+    # sqlite3.IntegrityError on a duplicate -> ValueError(f"{subject} already has an API token named {name!r}.")
+def list_api_tokens(self) -> list[tuple[str, str, int, int]]                   # (subject, name, expires_at, created_at)
 def revoke_api_token(self, subject: str, name: str) -> bool
-def purge_expired(self) -> None                                                          # deletes expired auth_requests, auth_codes, tokens
+def purge_expired(self) -> None
+    # deletes expired auth_requests, auth_codes and tokens (used or not), and oauth_clients older
+    # than 30 days that no token row names
 ```
 
-`AuthorizationParams` and `AuthorizationCode` are stored with `model_dump_json()` and read back
-with `model_validate_json()`; clients with `OAuthClientInformationFull.model_dump_json()`.
+`AuthorizationParams`, `AuthorizationCode` and clients are stored with `model_dump_json()` and read
+back with `model_validate_json()`.
 
 `GoogleOAuthProvider(auth: AuthConfig, http: HttpConfig, store: TokenStore, google: GoogleOidcClient, *, clock=time.time)`
-implements `OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]`
-(every store call through `asyncio.to_thread`):
+implements `OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]` with
+the SDK's exact signatures (every store call through `asyncio.to_thread`):
 
-- `CALLBACK_PATH = "/oauth/google/callback"`; `callback_url = http.public_url + CALLBACK_PATH`;
-  `resource_url = http.public_url + "/mcp"`.
-- `is_allowed_redirect_uri(uri: str) -> bool` (module function taking the allowlist): `True` if
-  `uri` is exactly in `auth.redirect_uri_allowlist`, or if `urlsplit(uri)` has scheme `http` and
-  hostname in `{"localhost", "127.0.0.1", "::1"}` (Claude Code's local callback, any port and path).
+- `START_PATH = "/oauth/google/start"`, `CALLBACK_PATH = "/oauth/google/callback"`;
+  `callback_url = http.public_url + CALLBACK_PATH`; `resource_url = http.public_url + "/mcp"`.
+- `is_allowed_redirect_uri(uri: str, allowlist: Sequence[str]) -> bool` (module function): `True`
+  if `uri` is exactly in the allowlist, or if `urlsplit(uri)` has scheme `http` and hostname in
+  `{"localhost", "127.0.0.1", "::1"}` (Claude Code's local callback, any port and path).
 - `register_client(info)`: every `info.redirect_uris` entry must pass `is_allowed_redirect_uri`,
   else `RegistrationError("invalid_redirect_uri", "This server accepts only the redirect URIs of claude.ai, claude.com and local (loopback) addresses. Ask whoever runs it to add yours to auth.redirect_uri_allowlist.")`.
-  Then `store.save_client`. This allowlist is what stops a stranger from registering a client that
-  sends a signed-in person's code to their own site (ADR 0014); there is no separate consent page.
-- `authorize(client, params)`: re-check `is_allowed_redirect_uri(str(params.redirect_uri))`, else
-  `AuthorizeError("invalid_request", "This redirect URI is no longer allowed.")`;
-  `state = token_urlsafe(32)`, `nonce = token_urlsafe(32)`; `store.purge_expired()`;
-  `store.save_auth_request(state, client.client_id, params, nonce)`; return
-  `google.authorization_url(state, nonce, callback_url)`.
-- `async handle_google_callback(request: Request) -> Response` (mounted as a custom route, D11):
-  1. `pop_auth_request(request.query_params.get("state", ""))`; `None` → `HTMLResponse(page("This sign-in link has expired or was already used. Start again from your AI client."), 400)`.
-  2. If the query has `error` (the person cancelled at Google): 302 to
+  Then `store.save_client`. The allowlist is what stops a stranger's client from receiving a
+  signed-in person's code at their own site (ADR 0015).
+- `authorize(client, params)`:
+  1. `is_allowed_redirect_uri(str(params.redirect_uri), ...)` false →
+     `AuthorizeError("invalid_request", "This redirect URI is no longer allowed.")`.
+  2. `params.resource not in (None, resource_url)` →
+     `AuthorizeError("invalid_target", "This server only issues tokens for its own /mcp endpoint.")`.
+  3. `store.purge_expired()`; `count_pending_sign_ins() >= MAX_PENDING_SIGN_INS` →
+     `AuthorizeError("temporarily_unavailable", "Too many sign-ins are in progress; try again in a few minutes.")`.
+  4. `state`, `nonce` = `token_urlsafe(32)`; `save_auth_request(...)`; return
+     `f"{http.public_url}{START_PATH}?{urlencode({'state': state})}"`.
+- `async handle_google_start(request) -> Response` (custom route `GET START_PATH`): this binds the
+  sign-in to the browser that began it, so a Google link copied out of someone else's sign-in
+  cannot finish it. `binding = token_urlsafe(32)`; `bind_auth_request(state, binding)` false →
+  the 400 "expired" page below. Else 302 to `google.authorization_url(state, nonce, callback_url)`
+  (the nonce read with `get_auth_request(state)`) with `Set-Cookie: <BINDING_COOKIE>=<binding>; Path=/; HttpOnly; SameSite=Lax; Max-Age=600`
+  plus `; Secure` on https.
+- `async handle_google_callback(request) -> Response` (custom route `GET CALLBACK_PATH`):
+  1. `pop_auth_request(query "state")`; `None` →
+     `HTMLResponse(page("This sign-in link has expired or was already used. Start again from your AI client."), 400)`.
+  2. The request's `BINDING_COOKIE` value, hashed, must equal the row's `binding_hash` (and the
+     hash must not be `None`), compared with `hmac.compare_digest`; else
+     `HTMLResponse(page("This sign-in was started in a different browser. Start again from your AI client."), 400)`.
+  3. If the query has `error` (the person cancelled at Google): 302 to
      `construct_redirect_uri(str(params.redirect_uri), error="access_denied", state=params.state)`.
-  3. `identity = await google.exchange_code(code, callback_url, nonce)`; `GoogleOidcClientError` →
+  4. `identity = await google.exchange_code(query "code", callback_url, nonce)`; `GoogleOidcClientError` →
      `HTMLResponse(page("Google sign-in failed. Start again from your AI client."), 502)`.
-  4. `is_allowed_email(auth, identity.email, identity.hosted_domain)` false →
-     `HTMLResponse(page(f"{identity.email} may not publish pages on this server. Ask whoever runs it to add your address or domain."), 403)`
-     (`html.escape` the address).
-  5. `code = token_urlsafe(32)`; `AuthorizationCode(code=code, scopes=params.scopes or [SCOPE],
+  5. `is_allowed_email(auth, identity.email, identity.hosted_domain)` false →
+     `HTMLResponse(page(f"{html.escape(identity.email)} may not publish pages on this server. Ask whoever runs it to add your address or domain."), 403)`.
+  6. `code = token_urlsafe(32)`; `AuthorizationCode(code=code, scopes=params.scopes or [SCOPE],
      expires_at=clock() + AUTH_CODE_TTL, client_id=client_id, code_challenge=params.code_challenge,
      redirect_uri=params.redirect_uri, redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
-     resource=params.resource, subject=identity.email)`; `store.save_code`; 302 to
-     `construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state)`.
-  6. Log `logger.info("signed in %s for client %s", identity.email, client_id)`.
-  `page(message)` is a minimal HTML document: `<!doctype html><meta charset="utf-8"><title>html-artifact-deploy</title><p>{message}</p>`,
-  served with header `Cache-Control: no-store`.
-- `load_authorization_code(client, code)` → `store.get_code(client.client_id, code)`.
-- `exchange_authorization_code(client, code)`: `consume_code(code.code)` false →
-  `TokenError("invalid_grant", "The authorization code was already used.")`; `family = token_urlsafe(16)`;
-  issue access and refresh with `subject = code.subject`, `resource = code.resource`; return
-  `OAuthToken(access_token=…, token_type="Bearer", expires_in=ACCESS_TOKEN_TTL, scope=" ".join(code.scopes), refresh_token=…)`.
-- `load_refresh_token(client, token)`: row of kind `refresh` whose `client_id` matches, as
-  `RefreshToken(token, client_id, scopes, expires_at, resource, subject)`; else `None`.
-- `exchange_refresh_token(client, refresh_token, scopes)`: requested `scopes` must be a subset of
-  the token's, else `TokenError("invalid_scope", "Those scopes were not granted.")`;
-  `delete_token(refresh_token.token)` false (already rotated: a replay) → `revoke_family(family)`
-  and `TokenError("invalid_grant", "The refresh token was already used.")`; else issue a new pair in
-  the same family (`scopes or refresh_token.scopes`).
-- `load_access_token(token)`: row of kind `access` or `api` → `AccessToken(token=token,
+     resource=params.resource, subject=identity.email)`; `save_code(code, identity.hosted_domain)`;
+     log `logger.info("signed in %s for client %s", identity.email, client_id)`; 302 to
+     `construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state)`, deleting the
+     binding cookie (`Max-Age=0`).
+  Every response here carries `Cache-Control: no-store`. `page(message)` is
+  `<!doctype html><meta charset="utf-8"><title>html-artifact-deploy</title><p>{message}</p>`.
+- `load_authorization_code(client, code)`: `get_code`; `None` → `None`; if `used_family` is set (a
+  replayed code) → `revoke_family(used_family)` and return `None` (RFC 6749 section 4.1.2).
+- `exchange_authorization_code(client, code)`: `family = token_urlsafe(16)`;
+  `mark_code_used(code.code, family)` false (lost a race with a concurrent exchange) →
+  `TokenError("invalid_grant", "The authorization code was already used.")`; issue an access token
+  (`expires_at = now + ACCESS_TOKEN_TTL`) and a refresh token (`now + REFRESH_TOKEN_TTL`), both
+  with `subject = code.subject`, the stored `hosted_domain`, `resource = code.resource`; return
+  `OAuthToken(access_token=…, token_type="Bearer", expires_in=ACCESS_TOKEN_TTL, scope=" ".join(code.scopes), refresh_token=…)`
+  (`# nosec B106  # the OAuth token type, not a password`).
+- `load_refresh_token(client, token)`: `get_token(token, ("refresh",))`; `None` or another
+  `client_id` → `None`; `used_at` set (a replayed, already-rotated token) → `revoke_family` and
+  `None`; subject no longer allowed (`is_allowed_email(auth, subject, hosted_domain)` false) →
+  `revoke_family` and `None`; else `RefreshToken(token, client_id, scopes, expires_at, resource, subject)`.
+- `exchange_refresh_token(client, refresh_token, scopes)`: `mark_used(refresh_token.token)` false
+  (lost a race) → `revoke_family` and `TokenError("invalid_grant", "The refresh token was already used.")`;
+  else issue a new access token and a new refresh token in the same family, the refresh token
+  keeping the old row's `expires_at`, with `scopes or refresh_token.scopes`. (The SDK itself
+  rejects scopes that were not granted before calling this, so there is no scope check here.)
+- `load_access_token(token)`: `get_token(token, ("access", "api"))`; `None` → `None`; subject no
+  longer allowed → `None` (and for kind `access`, `revoke_family`); else `AccessToken(token=token,
   client_id=row["client_id"], scopes=row["scopes"].split(), expires_at=row["expires_at"],
-  resource=resource_url, subject=row["subject"])`; else `None`.
-- `revoke_token(token)`: an access token → `delete_token`; a refresh token → `revoke_family`.
+  resource=row["resource"] or resource_url, subject=row["subject"])`.
+- `revoke_token(token)`: `token` is an `AccessToken` or `RefreshToken`; look up its row and
+  `revoke_family(row["family"])` (both kinds carry the family); an API token is not revocable here
+  (only `token revoke` on the command line).
 
-MCP `AuthSettings` built by `build_http_app`:
+Flow tests through the SDK routes use the real clock (the SDK's token handler and bearer
+middleware read `time.time()`); expiry tests call the provider and store directly with an
+injected clock. Race branches (`mark_code_used` false, `mark_used` false) are covered by direct
+calls that mark the row first.
+
+`def auth_settings(http: HttpConfig) -> AuthSettings` (in `oauth_provider.py`) returns
 `AuthSettings(issuer_url=http.public_url, resource_server_url=http.public_url + "/mcp",
 service_documentation_url=None, client_registration_options=ClientRegistrationOptions(enabled=True,
 valid_scopes=[SCOPE], default_scopes=[SCOPE]), revocation_options=RevocationOptions(enabled=True),
@@ -630,17 +710,19 @@ MCP_PATH = "/mcp"
 HEALTH_PATH = "/healthz"
 
 def max_request_body_size(max_bytes: int) -> int:   # max(DEFAULT_MAX_REQUEST_BODY_SIZE, 2 * max_bytes + 1_048_576)
-def build_http_app(config: Config, *, google: GoogleOidcClient | None = None, clock: Callable[[], float] = time.time) -> Starlette: ...
+def build_http_app(config: Config, *, environ: Mapping[str, str] = os.environ, google: GoogleOidcClient | None = None, clock: Callable[[], float] = time.time) -> Starlette: ...
 ```
 
-`build_http_app`: `http, auth = require_http(config)`; `db = StateDB(config.state_dir / DB_FILE_NAME)`;
+`build_http_app(config, *, environ=os.environ, google=None, clock=time.time)`: `http, auth = require_http(config)`; `db = StateDB(config.state_dir / DB_FILE_NAME)`;
 `store = LocalFolderStore(config.pages.root)`; `store.check()`; `service`; `tokens = TokenStore(db)`;
-`google = google or GoogleOidcClient(auth.google_client_id, auth.google_client_secret)`;
+`google = google or GoogleOidcClient(auth.google_client_id, google_client_secret(auth, environ))`;
 `provider = GoogleOAuthProvider(...)`; `owner` = a function that returns
 `get_access_token().subject` and raises `ToolError("Not signed in.")` if the token or its subject
 is `None`; `server = build_server(AppContext(service, owner, uploads), auth_server_provider=provider, auth=<D10 settings>)`;
+`server.custom_route(START_PATH, ["GET"])(provider.handle_google_start)`;
 `server.custom_route(CALLBACK_PATH, ["GET"])(provider.handle_google_callback)`;
-`server.custom_route(HEALTH_PATH, ["GET"])` returning `PlainTextResponse("ok")`; then
+`server.custom_route(HEALTH_PATH, ["GET"])` returning `PlainTextResponse("ok")`; then (every
+`custom_route` call must come before this one: the SDK copies the route list when it builds the app)
 `server.streamable_http_app(streamable_http_path=MCP_PATH, json_response=True, stateless_http=True,
 max_request_body_size=max_request_body_size(config.pages.max_bytes),
 transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True,
@@ -654,7 +736,8 @@ Stateless JSON responses: no MCP session lives in the process, so a restart or a
 loses nothing, and there is no server-to-client stream to keep open behind the reverse proxy.
 
 `serve-http` runs `uvicorn.run(app, host=http.listen_host, port=http.listen_port,
-proxy_headers=True, forwarded_allow_ips="127.0.0.1", log_level="info")` inside
+proxy_headers=True, forwarded_allow_ips="127.0.0.1", log_level="info", access_log=False)`
+(no access log: request lines would carry upload URLs and Google's `code`, which are secrets) inside
 `def _run_uvicorn(app: Starlette, http: HttpConfig) -> None:  # pragma: no cover` in `__main__.py`
 (its one line runs only in the integration test's subprocess, which coverage does not see).
 
@@ -683,22 +766,29 @@ class UploadStore:
 
 - `folder` is `config.state_dir / "uploads"`, created with mode `0o700`. A file is
   `folder / secret_hash(upload_id)`.
-- `create`: purge expired rows and their files; `upload_id = secrets.token_urlsafe(32)`; insert
+- `MAX_OPEN_UPLOADS = 10` per owner.
+- `create`: purge expired rows and their files, and `*.part` files older than `UPLOAD_TTL`; if the
+  owner has `MAX_OPEN_UPLOADS` unexpired rows →
+  `UploadError(f"You have {MAX_OPEN_UPLOADS} uploads waiting. Publish them, or wait 15 minutes for them to expire.")`;
+  `upload_id = secrets.token_urlsafe(32)`; insert
   `(secret_hash, owner, 'open', NULL, now + UPLOAD_TTL)`; `upload_url = f"{public_url}/uploads/{upload_id}"`.
 - `handle_put` (route `PUT /uploads/{upload_id}`, no bearer token: the URL is the capability):
   unknown, expired or `filled` → `PlainTextResponse("Unknown or expired upload.", 404)`;
   `Content-Length` header over `max_bytes` → `PlainTextResponse(f"The file is over the {max_bytes:,}-byte limit.", 413)`;
-  stream `request.stream()` into `<file>.part`, counting bytes, and stop with the same 413 (and
+  stream `request.stream()` into a temporary file from
+  `tempfile.mkstemp(dir=folder, suffix=".part")` (so two concurrent PUTs never share a file), counting bytes, and stop with the same 413 (and
   delete the part file) as soon as the count exceeds `max_bytes`; empty body →
-  `PlainTextResponse("The upload is empty.", 400)`; else `os.replace` to the final name, mark
-  `filled` with `bytes`, `PlainTextResponse(f"Uploaded {n:,} bytes. Now call publish_page with this upload_id.", 201)`.
+  `PlainTextResponse("The upload is empty.", 400)`; else mark the row `filled` with
+  `UPDATE … WHERE state = 'open'` (if no row changed, a concurrent PUT won: delete the part file and
+  answer the 404 above), then `os.replace` to the final name, `PlainTextResponse(f"Uploaded {n:,} bytes. Now call publish_page with this upload_id.", 201)`.
 - `read(owner, upload_id)`: the row must exist, be `filled`, not expired, and have this `owner`,
   else `UploadError("No uploaded file for that upload_id. Call create_page_upload, PUT the file to its upload_url, then call publish_page again.")`.
   Returns the file's bytes.
 - `discard(upload_id)`: delete the row and the file (missing file ignored).
 
 `build_http_app` builds `UploadStore(db, config.state_dir / "uploads", http.public_url,
-config.pages.max_bytes)` and registers `server.custom_route(UPLOAD_PATH, ["PUT"])(uploads.handle_put)`.
+config.pages.max_bytes)` and registers `server.custom_route(UPLOAD_PATH, ["PUT"])(uploads.handle_put)` before calling
+`streamable_http_app`.
 
 ### D13. Command line: `__main__.py`
 
@@ -718,14 +808,19 @@ html-artifact-deploy [--config PATH] token revoke --user EMAIL --name NAME
   nothing on stdout.
 - Every `ConfigError`, `StorageError` or `StateError` prints `html-artifact-deploy: <message>` on
   **stderr** and returns `2`.
-- `token create`: `--days` default `365`, 1…3650; the address must pass
+- `token create`: `--user` is lowercased; `--days` default `365`, 1…3650; the address must pass
   `is_allowed_email(auth, email, email.rpartition("@")[2])`, else stderr
   `html-artifact-deploy: <email> is not in auth.allowed_emails or auth.allowed_domains.` and `2`.
   Prints only the token on stdout, then on stderr
   `Store this token now; it is not shown again. Use it as: Authorization: Bearer <token>`.
-- `token list` prints one tab-separated line per API token: `subject  name  expires(ISO or "never")  created(ISO)`.
+- `token list` prints one tab-separated line per API token: `subject  name  expires(ISO)  created(ISO)`.
 - `token revoke` prints `Revoked.` or, if nothing matched, stderr `html-artifact-deploy: no such token.` and `1`.
-- `token` and `serve-http` need `[http]` and `[auth]` (`require_http`).
+- `token` and `serve-http` need `[http]` and `[auth]` (`require_http`); only `serve-http` and
+  `check-config` read the client secret (D2).
+- On a server, every command runs as the service user, so files in `state.dir` keep one owner:
+  `sudo -u html-artifact-deploy /opt/html-artifact-deploy/bin/html-artifact-deploy --config /etc/html-artifact-deploy/config.toml token create …`.
+  `check-config` needs the secret too, so the guide runs it through
+  `sudo systemd-run --pty --wait --uid=html-artifact-deploy -p EnvironmentFile=/etc/html-artifact-deploy/secrets.env …`.
 
 ### D14. Deployment (documentation and example files)
 
@@ -763,9 +858,8 @@ pages.example.com {
 `file_server` without `browse` lists no directories, so the random folder name keeps other
 pages from being found.
 
-`docs/deployment.md` (p8), in order: 1. DNS; 2. Google OAuth client (Google Cloud console →
-APIs & Services → OAuth consent screen, **Internal**; Credentials → Create OAuth client ID → **Web
-application**, authorized redirect URI `https://publish.example.com/oauth/google/callback`);
+`docs/deployment.md` (p8), in order: 1. DNS; 2. Google OAuth client (Google Auth Platform: Branding, then Audience
+set to **Internal**, then Clients → Create client → **Web application**, authorized redirect URI `https://publish.example.com/oauth/google/callback`);
 3. `sudo apt install caddy` (Caddy's apt repository), `sudo useradd --system --home-dir /var/lib/html-artifact-deploy --shell /usr/sbin/nologin html-artifact-deploy`,
 `sudo install -d -o html-artifact-deploy -g html-artifact-deploy -m 755 /srv/pages`;
 4. `sudo python3 -m venv /opt/html-artifact-deploy && sudo /opt/html-artifact-deploy/bin/pip install html-artifact-deploy`
@@ -789,9 +883,11 @@ commands.
   `https://publish.example.com/mcp`; sign in with Google when asked.
 - **Claude Code, OAuth**: `claude mcp add --transport http html-artifact-deploy https://publish.example.com/mcp`,
   then `/mcp` to sign in.
-- **Claude Code, API token**: an administrator runs `html-artifact-deploy token create --user you@example.com --name laptop`;
+- **Claude Code, API token**: an administrator runs `token create --user you@example.com --name laptop` as the service user (D13);
   then `claude mcp add --transport http html-artifact-deploy https://publish.example.com/mcp --header "Authorization: Bearer <token>"`.
-- **Local, stdio** (on the web server itself): `claude mcp add html-artifact-deploy -- html-artifact-deploy --config /etc/html-artifact-deploy/config.toml`.
+- **Local, stdio** (development and trying it out, with a config whose `pages.root` and
+  `state.dir` are folders you own): `claude mcp add html-artifact-deploy -- html-artifact-deploy --config ~/html-artifact-deploy.toml`.
+  Not for a server deployment, whose folders belong to the service user.
 
 ### Rejected alternatives (the ADRs' "Alternatives considered")
 
@@ -811,9 +907,15 @@ commands.
 - **Any OIDC provider**: the user chose Google Workspace; `hd` is Google-specific. A second
   provider is a new `*_oidc.py` beside this one.
 - **A consent page after sign-in**: replaced by the redirect URI allowlist, which removes the
-  attacker-registered-client case outright instead of asking the person to spot it.
-- **Verifying the ID token signature with Google's JWKS**: needs `cryptography` as a new runtime
-  dependency and a key cache; the token-endpoint-over-TLS rule makes it redundant here.
+  attacker-registered-client case outright instead of asking the person to spot it. The browser
+  binding cookie (D10) covers the remaining case, a Google sign-in link forwarded to someone else.
+- **Verifying the ID token signature with Google's JWKS** (PyJWT's `PyJWKClient`, installed with
+  `mcp`): adds a key fetch, a key cache and a key-rotation failure mode for no gain, since OpenID
+  Connect Core section 3.1.3.7 makes TLS validation of the token endpoint sufficient for a token
+  received directly from it.
+- **Refresh tokens that renew their own lifetime**: someone removed from the allowlist would keep
+  access by refreshing forever; the lifetime is absolute and the allowlist is re-checked on every
+  refresh and every request.
 - **JWT access tokens**: cannot be revoked without a deny list; opaque tokens in SQLite can.
 - **JSON files for state**: several concurrent writers (sign-ins, publishes, uploads) need
   transactions; SQLite is in the standard library.
@@ -822,23 +924,24 @@ commands.
 
 ## ADRs
 
-- **0010** — HTML Artifact Deploy is a standalone MCP server that runs on the web server and
+- **0011** — HTML Artifact Deploy is a standalone MCP server that runs on the web server and
   writes pages into the folder the web server serves, behind a `PageStore` interface; it never
   serves pages itself. (Rejected: PrivacyFence connector, SFTP, serving from the process, adopting
   an existing project.)
-- **0011** — Pages are served from a separate host name with a `Content-Security-Policy: sandbox`
+- **0012** — Pages are served from a separate host name with a `Content-Security-Policy: sandbox`
   header; the configuration refuses a pages host equal to the server's host.
-- **0012** — A page's link is a random 120-bit id plus a readable slug, open to anyone with the
+- **0013** — A page's link is a random 120-bit id plus a readable slug, open to anyone with the
   link; ownership lives in a per-person index, and the folder is never listed.
-- **0013** — The server is its own OAuth 2.1 authorization server (dynamic registration, opaque
+- **0014** — The server is its own OAuth 2.1 authorization server (dynamic registration, opaque
   tokens hashed in SQLite) and delegates only identity to Google Workspace.
-- **0014** — Dynamic client registration accepts only allowlisted redirect URIs (claude.ai,
-  claude.com, loopback) instead of showing a consent page.
-- **0015** — Google's ID token is trusted by TLS from the token endpoint, not by its signature, so
-  no `cryptography` dependency.
-- **0016** — All server state is one SQLite file with `PRAGMA user_version` as its schema version.
-- **0017** — Large pages arrive through one-time capability upload URLs, not a tool argument.
-- **0018** — Streamable HTTP runs stateless with JSON responses, and `starlette` and `uvicorn`
+- **0015** — Dynamic client registration accepts only allowlisted redirect URIs (claude.ai,
+  claude.com, loopback) instead of showing a consent page, and each Google sign-in is bound to the
+  browser that started it by a cookie.
+- **0016** — Google's ID token is trusted because it comes straight from Google's token endpoint
+  over TLS, not by checking its signature against Google's published keys.
+- **0017** — All server state is one SQLite file with `PRAGMA user_version` as its schema version.
+- **0018** — Large pages arrive through one-time capability upload URLs, not a tool argument.
+- **0019** — Streamable HTTP runs stateless with JSON responses, and `starlette` and `uvicorn`
   are declared runtime dependencies (already installed by `mcp`).
 
 ## Manual steps
@@ -887,8 +990,6 @@ After implementation (`manual_after`), on real infrastructure, following the ste
   has. If a worker's container does not, it runs `/qa-record google_openid_configuration`
   (dispatches `qa-record-fixture.yml`); if that queues for more than 30 minutes (no runner online),
   it stops with `status=blocked`.
-- **Windows.** `tests.yml` runs on Windows (not required). `os.chmod` modes and `fsync` behave
-  differently there; tests assert file modes only under `@pytest.mark.skipif(sys.platform == "win32", ...)`.
 
 ## Implementation manifest
 
@@ -918,7 +1019,7 @@ verify_after_merge:
   - bandit -q -c pyproject.toml -r src
 final_checks:
   - docs/publish-pages-plan.md and docs/publish-pages-plan-manual-steps.html are deleted and nothing links to them (grep -rn "publish-pages-plan" . --exclude-dir=.git returns nothing)
-  - ADRs 0010 to 0018 exist, each is Accepted, and each is in docs/adr/README.md's index
+  - ADRs 0011 to 0019 exist, each is Accepted, and each is in docs/adr/README.md's index
   - CHANGELOG.md has [Unreleased] entries for the tools, sign-in, uploads and deployment, and no version heading
   - echo appears nowhere in src/ or tests/ (grep -rn '"echo"' src tests returns nothing)
   - build.yml dispatched against feature/publish-pages is green, and the run is linked in the PR
@@ -935,42 +1036,43 @@ phases:
       - tests/unit/test_pages.py
       - tests/unit/test_storage.py
       - deploy/config.example.toml
-      - pyproject.toml
     brief: |
-      Read docs/publish-pages-plan.md sections D1, D2, D3, D4 first; they are the spec.
-      1. pyproject.toml: change the one [[tool.mypy.overrides]] block's `module = "html_artifact_deploy.server"`
-         to `module = "html_artifact_deploy.*"` (every module is strict from its first commit). Change nothing else.
-      2. Create src/html_artifact_deploy/pages.py exactly as D3 (module docstring, `from __future__ import annotations`).
-      3. Create src/html_artifact_deploy/config.py exactly as D2: the constants, the four dataclasses, ConfigError,
-         resolve_config_path, load_config (every check in the D2 table, in that order, with those messages
-         prefixed by f"{path}: "), require_http, is_allowed_email. Use tomllib. The secret is read from the
-         `environ` argument, never os.environ directly.
-      4. Create src/html_artifact_deploy/storage.py exactly as D4 (StorageError, PageStore Protocol, LocalFolderStore).
-      5. Create deploy/config.example.toml: the D2 example, each key with a one-line comment saying what it is
-         and whether it is required.
-      6. Tests (marker `unit`, class-per-behaviour, docstring naming the module):
+      Read docs/publish-pages-plan.md sections D1, D2, D3, D4 first; they are the spec. Do not edit CHANGELOG.md or
+      pyproject.toml (p3 and p9 own them).
+      1. Create src/html_artifact_deploy/pages.py exactly as D3 (module docstring, `from __future__ import annotations`).
+      2. Create src/html_artifact_deploy/config.py exactly as D2: the constants (DEFAULT_SECRET_ENV with its nosec
+         comment), the four dataclasses, ConfigError, resolve_config_path, load_config (every check in the D2 table, in
+         that order, with those messages prefixed by f"{path}: "), require_http, is_allowed_email,
+         google_client_secret. Use tomllib. load_config never reads the secret.
+      3. Create src/html_artifact_deploy/storage.py exactly as D4 (StorageError, PageStore Protocol, LocalFolderStore).
+      4. Create deploy/config.example.toml: the D2 example, each key with a one-line comment saying what it is and
+         whether it is required.
+      5. Tests (marker `unit`, class-per-behaviour, docstring naming the module):
          - tests/unit/test_pages.py: new_page_id matches PAGE_ID_RE and 1000 calls are distinct; slugify on
-           "Q3 report: Ünits & Co." == "q3-report-units-co", on "" and "!!!" == "page", on 100 × "a" has length 60,
-           on "a" * 59 + " b" (cut then strip); clean_title rejects "", "   ", 201 chars; page_url format and its
-           ValueError for a bad id or slug.
-         - tests/unit/test_config.py: a valid full file (write TOML into tmp_path) loads into the expected Config;
-           a minimal file (only [pages] and [state]) gives http=None, auth=None, stdio_user="local",
-           max_bytes=16_000_000; one parametrized test per row of the D2 table asserting the exact message;
-           resolve_config_path precedence (cli > env > default); require_http error; is_allowed_email cases
-           (exact address, domain with matching hd, domain without hd, domain with other hd, case-insensitivity);
-           deploy/config.example.toml loads with {"HTML_ARTIFACT_DEPLOY_GOOGLE_CLIENT_SECRET": "x"} as environ.
-         - tests/unit/test_storage.py: write then read back (bytes, file name `<slug>.html` under `<root>/<page_id>/`),
-           replace keeps one file and no `.tmp` leftovers, modes 0o755/0o644 (skip on win32), delete returns True
-           then False, ValueError for a bad id/slug, symlinked page folder refused (skip on win32), check() on a
-           missing root, an OSError during write (monkeypatch os.replace to raise) removes the temp file and raises
-           StorageError with the D4 message, same for delete (monkeypatch shutil.rmtree).
-      7. Run the coverage command from the plan's Risks section; the whole suite must stay at 100%.
-      Stop with status=blocked if tomllib rejects the D2 example as written.
+           "Q3 report: Ünits & Co." == "q3-report-units-co", on "" and "!!!" == "page", on "a" * 100 has length 60,
+           on "a" * 59 + " b" equals "a" * 59; clean_title rejects "", "   ", 201 chars and strips; page_url format
+           and its ValueError for a bad id or slug.
+         - tests/unit/test_config.py: a full file (TOML written into tmp_path) loads into the expected Config; a minimal
+           file (only [pages] and [state]) gives http=None, auth=None, stdio_user="local", max_bytes=16_000_000; one
+           parametrized case per row of the D2 table asserting the exact message; resolve_config_path precedence
+           (cli > env > default); require_http error; is_allowed_email (exact address in any case; hd in
+           allowed_domains; hd None; hd of another domain; an address whose own domain is allowed but hd is None →
+           False); google_client_secret returns the value, and raises the D2 message when unset and when empty;
+           deploy/config.example.toml loads with an empty environ.
+         - tests/unit/test_storage.py: write then read back (bytes, file `<root>/<page_id>/<slug>.html`), replace keeps
+           one file and no `.tmp` leftovers, modes 0o755 and 0o644, delete returns True then False, ValueError for a
+           bad id or slug in write and delete, a symlinked page folder is refused in write and delete, check() on a
+           missing root and on a read-only root (chmod 0o555; skip if os.geteuid() == 0), an OSError from os.replace
+           removes the temp file and raises StorageError with D4's write message, the same with os.unlink also raising
+           (the error still propagates as StorageError), an OSError from tempfile.mkstemp, and an OSError from
+           shutil.rmtree raising StorageError with D4's delete message.
+      6. Run the coverage command from the plan's Risks section; the whole suite must stay at 100%.
+      Stop with status=blocked if tomllib rejects the D2 example as written, or if 100% branch coverage of config.py
+      needs a `# pragma: no cover`.
     acceptance:
       - python3 -m pytest tests/unit/test_config.py tests/unit/test_pages.py tests/unit/test_storage.py -q passes
       - python3 -m pytest -q --cov=src/html_artifact_deploy --cov-branch --cov-report=json:coverage.json && python3 scripts/check_coverage_floor.py coverage.json passes
-      - python3 scripts/mypy_strict_modules.py passes and its output names html_artifact_deploy.config
-      - grep -c 'module = "html_artifact_deploy.\*"' pyproject.toml prints 1
+      - mypy --strict src/html_artifact_deploy/config.py src/html_artifact_deploy/pages.py src/html_artifact_deploy/storage.py passes
       - ruff check . && ruff format --check . && bandit -q -c pyproject.toml -r src pass
 
   - id: p2-state-db
@@ -983,25 +1085,26 @@ phases:
       - tests/unit/test_state.py
       - tests/unit/test_page_index.py
     brief: |
-      Read docs/publish-pages-plan.md sections D1, D5, D6 first; they are the spec.
+      Read docs/publish-pages-plan.md sections D1, D5, D6 first; they are the spec. Do not edit CHANGELOG.md or
+      pyproject.toml.
       1. Create src/html_artifact_deploy/state.py exactly as D5: SCHEMA_VERSION, DB_FILE_NAME, StateError, secret_hash,
-         StateDB with __init__, transaction(), close(). The whole schema-version-1 SQL from D5 runs in one
-         transaction when user_version is 0.
+         StateDB with __init__, transaction(), close(). The whole schema-version-1 SQL from D5 (all six tables and three
+         indexes, including the binding_hash, hosted_domain, family and used_at columns) runs in one transaction when
+         user_version is 0.
       2. Create src/html_artifact_deploy/page_index.py exactly as D6 (PageRecord, PageIndex). Each method uses
          db.transaction(). `get` filters on both owner and page_id. `list` orders by updated_at DESC, page_id ASC,
-         LIMIT limit. `upsert` is INSERT ... ON CONFLICT(page_id) DO UPDATE SET owner, title, slug, bytes, sha256,
+         LIMIT limit. `upsert` is INSERT … ON CONFLICT(page_id) DO UPDATE SET owner, title, slug, bytes, sha256,
          updated_at (created_at is not overwritten).
-      3. Tests (marker `unit`), using tmp_path for the database:
-         - tests/unit/test_state.py: a new file gets user_version 1 and all six tables (query sqlite_master);
-           reopening does not re-run the schema; a file with user_version 7 raises StateError with the D5 message;
-           the file mode is 0o600 (skip on win32); transaction() rolls back on an exception (insert, raise, row absent);
-           secret_hash equals hashlib.sha256 hex.
+      3. Tests (marker `unit`), database under tmp_path:
+         - tests/unit/test_state.py: a new file gets user_version 1, all six tables and their columns (compare
+           `PRAGMA table_info` names with D5); reopening does not re-run the schema; a file with user_version 7 raises
+           StateError with the D5 message; the file mode is 0o600; transaction() rolls back on an exception (insert,
+           raise, row absent); close() then a transaction raises sqlite3.ProgrammingError; secret_hash equals
+           hashlib.sha256 hex.
          - tests/unit/test_page_index.py: upsert/get round trip; get with another owner returns None; list ordering,
-           limit, and other owners' pages excluded; upsert of an existing page keeps created_at; remove returns True
-           then False; remove with another owner returns False and leaves the row.
+           limit, other owners' pages excluded; upsert of an existing page keeps created_at; remove returns True then
+           False; remove with another owner returns False and leaves the row.
       4. Keep the whole suite at 100% coverage (Risks section command).
-      Do not touch pyproject.toml: p1 widens the mypy override. If p1 has not merged yet when you run
-      scripts/mypy_strict_modules.py, run `mypy --strict src/html_artifact_deploy/state.py src/html_artifact_deploy/page_index.py` instead and report it.
     acceptance:
       - python3 -m pytest tests/unit/test_state.py tests/unit/test_page_index.py -q passes
       - python3 -m pytest -q --cov=src/html_artifact_deploy --cov-branch --cov-report=json:coverage.json && python3 scripts/check_coverage_floor.py coverage.json passes
@@ -1009,13 +1112,15 @@ phases:
       - ruff check . && ruff format --check . && bandit -q -c pyproject.toml -r src pass
 
   - id: p3-service-and-stdio-tools
-    title: PageService, the publish/list/unpublish tools, and stdio with --config
+    title: PageService, the publish/list/unpublish tools, stdio with --config, first mypy promotions
     depends_on: [p1-config-and-storage, p2-state-db]
     complexity: M
     touches:
       - src/html_artifact_deploy/service.py
       - src/html_artifact_deploy/server.py
       - src/html_artifact_deploy/__main__.py
+      - pyproject.toml
+      - scripts/check_coverage_floor.py
       - tests/unit/test_service.py
       - tests/unit/test_server.py
       - tests/unit/test_main.py
@@ -1023,55 +1128,61 @@ phases:
       - tests/packaged/test_installed_server.py
       - README.md
     brief: |
-      Read docs/publish-pages-plan.md sections D6, D7, D8, D13 first; they are the spec.
-      1. Create src/html_artifact_deploy/service.py exactly as D7 (PageError, PublishResult, PageService with
-         url_for, publish, check_can_publish, list_pages, unpublish). Index calls go through asyncio.to_thread.
-      2. Rewrite src/html_artifact_deploy/server.py per D8: keep SERVER_NAME and server_info; delete echo; add
-         AppContext and build_server(app, *, auth_server_provider=None, auth=None), passing both to MCPServer.
-         In this phase AppContext has only `service` and `owner` (uploads.py does not exist yet), and a non-empty
-         upload_id (with html empty) always raises ToolError("Uploads are not available on this connection; pass the
-         page as html."). p7 adds the `uploads` field, the upload branch and create_page_upload.
-         Register publish_page, list_pages, unpublish_page with the exact docstrings and ToolAnnotations from D8.
-         Update the module docstring: it now describes the page tools and that owner resolution comes from AppContext.
+      Read docs/publish-pages-plan.md sections D1, D6, D7, D8, D13 first; they are the spec. Do not edit CHANGELOG.md.
+      1. Create src/html_artifact_deploy/service.py exactly as D7 (PageError, PublishResult, PageService with url_for,
+         publish, check_can_publish, list_pages, unpublish). Index calls go through asyncio.to_thread.
+      2. Rewrite src/html_artifact_deploy/server.py per D8: keep SERVER_NAME and server_info; delete echo; add AppContext
+         with only `service` and `owner` (uploads.py does not exist yet; p7 adds the `uploads` field) and
+         build_server(app, *, auth_server_provider=None, auth=None), passing both to MCPServer. Register publish_page,
+         list_pages, unpublish_page with D8's exact docstrings and ToolAnnotations. In this phase a non-empty upload_id
+         (with html empty) always raises ToolError("Uploads are not available on this connection; pass the page as html.").
+         Update the module docstring: it describes the page tools and that the caller's identity comes from AppContext.
       3. Rewrite src/html_artifact_deploy/__main__.py for the stdio part of D13 only: `main(argv=None, environ=None)`,
-         top-level `--config`, `--version`; no subcommands yet. Load config (resolve_config_path + load_config), build
+         top-level `--config` and `--version`, no subcommands yet. Load config (resolve_config_path + load_config), build
          StateDB(config.state_dir / DB_FILE_NAME), LocalFolderStore(config.pages.root) with check(), PageIndex,
          PageService, AppContext(owner=lambda: config.stdio_user), then build_server(...).run("stdio").
          ConfigError/StorageError/StateError → print f"html-artifact-deploy: {exc}" to sys.stderr, return 2.
-      4. Tests:
-         - tests/unit/test_service.py: every step of D7's publish order with its exact message; replacement keeps slug
+      4. pyproject.toml: turn the mypy override's `module = "html_artifact_deploy.server"` into
+         `module = ["html_artifact_deploy.server", "html_artifact_deploy.config", "html_artifact_deploy.pages",
+         "html_artifact_deploy.storage", "html_artifact_deploy.state", "html_artifact_deploy.page_index",
+         "html_artifact_deploy.service"]`. scripts/check_coverage_floor.py: add `config.py` and `storage.py` to
+         MODULE_FLOORS at 100.0, each with a one-line comment (what it guards: the configuration's fail-closed checks;
+         writes into the published folder).
+      5. Tests:
+         - tests/unit/test_service.py: every step of D7's publish order with its exact message; a replacement keeps slug
            and created_at and sets created=False; another owner's page_id is refused; StorageError mapping for publish
            and unpublish (a fake PageStore raising StorageError; the index is unchanged after a failed unpublish);
            unpublish of a page whose folder is already gone succeeds; list clamping (0 → 1, 500 → 200);
-           check_can_publish; the log line contains page_id and owner and not the title (caplog).
+           check_can_publish; the log line has page_id and owner and not the title (caplog).
          - tests/unit/test_server.py: rewrite. A fixture builds a real PageService on tmp_path (LocalFolderStore +
-           StateDB) and AppContext(owner=lambda: "alice@example.com"). Through `mcp.Client(build_server(...))`:
-           tool list == {"publish_page", "list_pages", "unpublish_page", "server_info"}; each tool's annotations equal
-           D8's; every tool has a description; publish → file on disk and url shape; replace; list; unpublish → file
-           gone; each ToolError path returns is_error with the exact message (both html and upload_id; neither;
-           upload_id alone; unknown page_id; title too long); a second owner cannot see or remove alice's page
-           (build a second server with owner "bob@example.com" over the same database); server_info unchanged;
-           TestFreshInstances kept.
-         - tests/unit/test_main.py: extend. `--version` still works; a missing config file returns 2 with the D2 message
-           on stderr and nothing on stdout (capsys); a config whose pages.root does not exist returns 2; with a valid
-           config, monkeypatch MCPServer.run to record its argument and assert "stdio".
-         - tests/integration/test_stdio_contract.py: write a config into tmp_path (pages.root and state.dir under
-           tmp_path, public_base_url "https://pages.example.com"); pass ["-m", "html_artifact_deploy", "--config", path];
-           replace the echo test by a publish_page call whose result url starts with "https://pages.example.com/" and
-           whose file exists under tmp_path; keep the unknown-tool test.
-         - tests/packaged/test_installed_server.py: same temporary config and --config for the stdio test; still calls
+           StateDB) and AppContext(owner=lambda: "alice@example.com"). Through `mcp.Client(build_server(...))`: tool list
+           == {"publish_page", "list_pages", "unpublish_page", "server_info"}; each tool's annotations equal D8's; every
+           tool has a description; publish → file on disk and url shape; replace; list; unpublish → file gone; each
+           ToolError path returns is_error with the exact message (both html and upload_id; neither; upload_id alone;
+           unknown page_id; title too long); a second owner cannot see or remove alice's page (a second server with owner
+           "bob@example.com" over the same database); server_info unchanged; TestFreshInstances kept.
+         - tests/unit/test_main.py: REPLACE `test_runs_the_server_over_stdio` (it calls main([]) with no config, which
+           now returns 2). New tests: `--version` still works; a missing config file returns 2 with the D2 message on
+           stderr and nothing on stdout (capsys); a config whose pages.root does not exist returns 2; a state.dir file
+           with user_version 7 returns 2; with a valid config, monkeypatch MCPServer.run to record its argument and assert
+           "stdio"; `environ` defaults to os.environ (set HTML_ARTIFACT_DEPLOY_CONFIG with monkeypatch.setenv).
+         - tests/integration/test_stdio_contract.py: write a config into tmp_path (pages.root and state.dir under tmp_path,
+           public_base_url "https://pages.example.com"); pass ["-m", "html_artifact_deploy", "--config", path]; replace the
+           echo test by a publish_page call whose url starts with "https://pages.example.com/" and whose file exists
+           under tmp_path; keep the unknown-tool test.
+         - tests/packaged/test_installed_server.py: the same temporary config and --config for the stdio test; still calls
            server_info.
-      5. README.md: replace the tool table rows with publish_page, list_pages, unpublish_page, server_info (one line each,
-         what it does); change the Claude Code and Claude Desktop stdio examples to pass
-         `--config /etc/html-artifact-deploy/config.toml`. Leave the rest of the README for a later phase.
-      6. Full suite at 100% coverage. Then dispatch build.yml against this phase branch (steward table: "The built
-         wheel, and its packaged smoke test") and put the run URL and result in the PHASE-REPORT. A red packaged job
-         is this phase's to fix.
-      Stop with status=blocked if ToolAnnotations cannot be passed to @server.tool, or if mcp.Client does not expose
-      tool annotations on list_tools().
+      6. README.md: replace the tool table rows with publish_page, list_pages, unpublish_page, server_info (one line each);
+         change the Claude Code and Claude Desktop examples to pass `--config ~/html-artifact-deploy.toml`. Leave the rest
+         for p8.
+      7. Full suite at 100% coverage. Then dispatch build.yml against this phase branch (steward table: "The built wheel,
+         and its packaged smoke test") and put the run URL and result in the PHASE-REPORT. A red packaged job is this
+         phase's to fix.
+      Stop with status=blocked if ToolAnnotations cannot be passed to @server.tool, or if list_tools() does not return them.
     acceptance:
       - python3 -m pytest tests/unit tests/integration -q passes
       - python3 -m pytest -q --cov=src/html_artifact_deploy --cov-branch --cov-report=json:coverage.json && python3 scripts/check_coverage_floor.py coverage.json passes
+      - python3 scripts/mypy_strict_modules.py --list | grep -c "src/html_artifact_deploy/" prints 7
       - grep -rn '"echo"\|def echo' src tests returns nothing
       - python3 -m html_artifact_deploy --config /nonexistent.toml exits 2 and prints to stderr only
       - build.yml dispatched against the phase branch is green (run URL in PHASE-REPORT)
@@ -1082,49 +1193,52 @@ phases:
     depends_on: []
     complexity: S
     touches:
-      - src/html_artifact_deploy/google_oidc.py
-      - tests/unit/test_google_oidc.py
+      - src/html_artifact_deploy/google_oidc_client.py
+      - tests/unit/test_google_oidc_client.py
       - scripts/live_check.py
       - tests/fixtures/live/google_openid_configuration/openid-configuration.json
     brief: |
-      Read docs/publish-pages-plan.md section D9 first; it is the spec.
-      1. Create src/html_artifact_deploy/google_oidc.py exactly as D9 (constants, GoogleOidcClientError,
-         GoogleIdentity, GoogleOidcClient with authorization_url, exchange_code, _post_token_request, and a private
-         `_decode_id_token(id_token: str) -> dict[str, Any]`). The module docstring states the OpenID Connect Core 1.0
-         section 3.1.3.7 reasoning for not verifying the signature, in one or two sentences (write "section", never "§").
-      2. scripts/live_check.py: add the google_openid_configuration LiveCheck from D9 (fetch and redact functions
-         at module level, above CHECKS). Keep the "Empty until …" comment accurate or remove it.
-      3. Record the fixture: `python3 scripts/live_check.py --record google_openid_configuration`. Read the diff: it must
-         contain only the six keys from D9. Then `python3 scripts/live_check.py --check google_openid_configuration`
-         must print `ok`. If the container has no route to accounts.google.com, use `/qa-record google_openid_configuration`
-         instead (see Risks).
-      4. tests/unit/test_google_oidc.py (marker `unit`):
-         - authorization_url contains every D9 parameter (parse it with urllib.parse and compare the dict).
+      Read docs/publish-pages-plan.md section D9 first; it is the spec. Do not edit CHANGELOG.md or pyproject.toml.
+      1. Create src/html_artifact_deploy/google_oidc_client.py exactly as D9 (constants with GOOGLE_TOKEN_ENDPOINT's nosec
+         comment, GoogleOidcClientError, GoogleIdentity, GoogleOidcClient with authorization_url, exchange_code,
+         _post_token_request, and a private `_decode_id_token(id_token: str) -> dict[str, Any]`). The module docstring
+         states in one or two sentences why the signature is not verified (OpenID Connect Core 1.0 section 3.1.3.7;
+         write "section", never the section sign).
+      2. scripts/live_check.py: add the google_openid_configuration LiveCheck from D9 (fetch and redact functions at
+         module level, above CHECKS), and replace the comment `# name -> check. Empty until the server talks to an
+         upstream service.` with `# name -> check.`.
+      3. Record the fixture: `python3 scripts/live_check.py --record google_openid_configuration`. Read the diff: only the
+         six keys from D9. Then `python3 scripts/live_check.py --check google_openid_configuration` must print `ok`. If
+         the container has no route to accounts.google.com, run `/qa-record google_openid_configuration` instead (Risks).
+      4. tests/unit/test_google_oidc_client.py (marker `unit`):
+         - authorization_url contains every D9 parameter (parse with urllib.parse and compare the dict).
          - exchange_code with `_post_token_request` monkeypatched to return a dict whose id_token is built in the test
-           (header.payload.signature, base64url, no padding): success returns the lowercased email, hd and sub;
-           the form sent contains grant_type, code, redirect_uri, client_id, client_secret.
-         - one parametrized failure test per D9 check (wrong iss, wrong aud, expired exp with an injected clock, nonce
-           mismatch, missing email, email_verified False or missing, id_token with 2 parts, bad base64, non-JSON payload,
-           no id_token key), each raising GoogleOidcClientError("Google sign-in failed.") and logging "Google sign-in
-           failed" without the code or token (caplog).
-         - _post_token_request: monkeypatch urllib.request.urlopen to a fake returning JSON bytes (assert the Request's
-           URL, method, timeout=10); and to raise urllib.error.URLError → GoogleOidcClientError.
-         - class TestLiveFixtureParsing: load the committed fixture; authorization_endpoint == GOOGLE_AUTHORIZATION_ENDPOINT,
-           token_endpoint == GOOGLE_TOKEN_ENDPOINT, issuer in GOOGLE_ISSUERS, "email" in claims_supported.
+           (header.payload.signature, base64url without padding): success returns the lowercased email, hd and sub; the
+           form sent has grant_type, code, redirect_uri, client_id, client_secret.
+         - one parametrized failure case per D9 check (wrong iss, wrong aud, expired exp with an injected clock, nonce
+           mismatch, missing email, email_verified False or missing, an id_token of 2 parts, bad base64, a non-JSON
+           payload, no id_token key), each raising GoogleOidcClientError("Google sign-in failed.") and logging "Google
+           sign-in failed" without the code or token (caplog).
+         - _post_token_request: monkeypatch urllib.request.urlopen with a fake returning JSON bytes (assert the Request's
+           URL, method, and timeout=10), with one raising urllib.error.URLError, and with one returning non-JSON bytes;
+           the last two raise GoogleOidcClientError.
+         - class TestLiveFixtureParsing: load the committed fixture; authorization_endpoint ==
+           GOOGLE_AUTHORIZATION_ENDPOINT, token_endpoint == GOOGLE_TOKEN_ENDPOINT, issuer in GOOGLE_ISSUERS, "email" in
+           claims_supported.
       5. Full suite at 100% coverage.
     acceptance:
-      - python3 -m pytest tests/unit/test_google_oidc.py -q passes
+      - python3 -m pytest tests/unit/test_google_oidc_client.py -q passes
       - python3 scripts/live_check.py --check google_openid_configuration exits 0
       - python3 -m pytest -q --cov=src/html_artifact_deploy --cov-branch --cov-report=json:coverage.json && python3 scripts/check_coverage_floor.py coverage.json passes
       - ruff check . && ruff format --check . && bandit -q -c pyproject.toml -r src pass
-      - mypy --strict src/html_artifact_deploy/google_oidc.py passes
+      - mypy --strict src/html_artifact_deploy/google_oidc_client.py passes
 
   - id: p5-oauth-provider
     title: Token store and the OAuth 2.1 authorization server backed by Google sign-in
     depends_on: [p1-config-and-storage, p2-state-db, p4-google-client]
     complexity: M
     worker_model: opus
-    worker_model_reason: This is the server's authentication boundary (dynamic registration, code and refresh-token replay, redirect allowlist); a subtle mistake here is a security hole that tests written by the same worker may not catch.
+    worker_model_reason: This is the server's authentication boundary (dynamic registration, browser binding, code and refresh-token replay, the allowlist re-check); a subtle mistake is a security hole that tests written by the same worker may not catch.
     touches:
       - src/html_artifact_deploy/token_store.py
       - src/html_artifact_deploy/oauth_provider.py
@@ -1132,47 +1246,59 @@ phases:
       - tests/unit/test_oauth_provider.py
     brief: |
       Read docs/publish-pages-plan.md sections D2 (AuthConfig, is_allowed_email), D5, D9, D10 first; they are the spec.
-      Read .venv/lib/python3.11/site-packages/mcp/server/auth/provider.py and settings.py and the handlers/ directory
-      before writing: implement the provider Protocol with the SDK's exact method signatures.
-      1. Create src/html_artifact_deploy/token_store.py exactly as D10's TokenStore list. Only secret_hash values are
-         stored; `get_token` and `get_code` treat expires_at <= now as absent.
+      Read .venv/lib/python3.11/site-packages/mcp/server/auth/provider.py, settings.py, routes.py and handlers/ before
+      writing: implement the provider Protocol with the SDK's exact method signatures. Do not edit CHANGELOG.md or
+      pyproject.toml.
+      1. Create src/html_artifact_deploy/token_store.py exactly as D10's TokenStore list (prefix constants with their
+         nosec comments).
       2. Create src/html_artifact_deploy/oauth_provider.py exactly as D10: constants, is_allowed_redirect_uri,
-         GoogleOAuthProvider with every Protocol method and handle_google_callback, the `page()` helper, and a
-         `def auth_settings(http: HttpConfig) -> AuthSettings` function returning D10's AuthSettings (build_http_app
-         in p6 calls it).
-      3. tests/unit/test_token_store.py: every method, expiry with an injected clock, consume_code single use,
-         revoke_family, duplicate API token name → ValueError with D10's message, purge_expired, and that no plaintext
-         token appears in the database file (read the sqlite file's bytes and assert the token string is absent).
-      4. tests/unit/test_oauth_provider.py, with a fake GoogleOidcClient (a small class with authorization_url and an
-         async exchange_code that returns a configured GoogleIdentity or raises GoogleOidcClientError):
+         GoogleOAuthProvider with every Protocol method, handle_google_start, handle_google_callback, the `page()` helper,
+         and auth_settings(http).
+      3. tests/unit/test_token_store.py: every method; expiry with an injected clock; mark_code_used and mark_used return
+         True once then False; get_code reports used_family after mark_code_used; bind_auth_request binds once;
+         revoke_family; duplicate API token name → ValueError with D10's message; create_api_token lowercases the
+         subject; purge_expired (including used rows and an orphaned 31-day-old client, but not a client a token names);
+         no plaintext token or code appears in the database file (read its bytes and search for the string).
+      4. tests/unit/test_oauth_provider.py, with a fake GoogleOidcClient (a small class with authorization_url and an async
+         exchange_code returning a configured GoogleIdentity or raising GoogleOidcClientError). Build the app as
+         `MCPServer("t", auth_server_provider=provider, auth=auth_settings(http))` with one trivial tool, register
+         START_PATH and CALLBACK_PATH custom routes, then `streamable_http_app(streamable_http_path="/mcp",
+         json_response=True, stateless_http=True, transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))`,
+         and drive it with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url=http.public_url) inside
+         `async with app.router.lifespan_context(app):`. Use http.public_url = "http://127.0.0.1:8765" (so the cookie is
+         "hda_signin" without Secure). Flow tests use the real clock; expiry tests call the provider directly.
          - is_allowed_redirect_uri: both claude defaults, http://localhost:33418/callback, http://127.0.0.1/x,
            http://[::1]:5/cb allowed; https://evil.example/cb, http://example.com/cb, https://claude.ai/other refused.
-         - register_client refuses a client with one bad redirect URI among good ones (RegistrationError code and message).
-         - The full flow, driven through the real SDK routes: build the Starlette app with
-           `MCPServer(..., auth_server_provider=provider, auth=auth_settings(http))`, add the callback custom route,
-           `streamable_http_app(..., transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))`,
-           and drive it with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url=http.public_url)
-           (the Starlette app's lifespan must run: wrap it the way the SDK's own tests do, or use
-           `async with app.router.lifespan_context(app)`):
-           POST /register → GET /authorize (PKCE S256) → 302 to Google URL (assert state and nonce are present) →
-           GET /oauth/google/callback?state=…&code=… → 302 to the client's redirect URI with code and the client's state →
-           POST /token → access and refresh tokens → an authenticated POST /mcp `tools/list` succeeds with the bearer
-           token (use a server with one trivial tool) and fails 401 without it → refresh rotation works once → replaying
-           the old refresh token fails invalid_grant AND revokes the new one (its next use fails) → replaying the
-           authorization code fails invalid_grant → POST /revoke makes the access token fail.
-         - Callback negatives: unknown state (400, D10 message), state reused (400), `error=access_denied` from Google
-           (302 with error=access_denied and the client's state), GoogleOidcClientError (502), a non-allowed email
-           (403, message contains the html-escaped address), an allowed domain but hosted_domain None (403).
-         - An expired code (injected clock) is not loadable; an access token past ACCESS_TOKEN_TTL returns None from
-           load_access_token; an API-kind token row (inserted via TokenStore.create_api_token) loads as AccessToken with
-           client_id "api-token".
+         - register_client refuses a client with one bad redirect URI among good ones (code and message).
+         - Full flow: POST /register → GET /authorize (PKCE S256, redirect_uri http://localhost:9999/cb) → 302 to
+           START_PATH → GET START_PATH → 302 to the Google URL (state and nonce present) with the binding cookie → GET
+           CALLBACK_PATH?state=…&code=… (httpx2 client keeps the cookie) → 302 to the redirect URI with a code and the
+           client's state → POST /token → access and refresh tokens → POST /mcp tools/list with the bearer token succeeds
+           and without it gets 401 → refresh once works → replaying the old refresh token fails invalid_grant AND the new
+           refresh and access tokens stop working → replaying the authorization code fails invalid_grant AND revokes the
+           tokens issued from it → POST /revoke with an access token makes it and its refresh token fail.
+         - Negatives: authorize with a resource other than "<public_url>/mcp" (invalid_target); authorize when
+           MAX_PENDING_SIGN_INS requests are pending (temporarily_unavailable; monkeypatch the constant to 2); START_PATH
+           with an unknown state (400) and a second time for the same state (400); callback with an unknown state (400),
+           reused (400), with no cookie (400, "different browser" message), with a wrong cookie (400);
+           `error=access_denied` (302 with error=access_denied and the client's state); GoogleOidcClientError (502); a
+           non-allowed email (403, the message has the html-escaped address); hosted_domain None with only
+           allowed_domains configured (403); every callback response has Cache-Control: no-store.
+         - Allowlist re-check: after a successful flow, build a second provider over the same store with an AuthConfig that
+           no longer allows the address: load_access_token returns None, the refresh fails, and the family is gone.
+         - Direct calls: an expired code is not loadable (injected clock); an access token past ACCESS_TOKEN_TTL returns
+           None; the rotated refresh token keeps the original expires_at; an API token loads as an AccessToken with
+           client_id "api-token" and scopes ["pages"], and revoke_token does not remove it; the race branches
+           (mark_code_used or mark_used already done before exchange_* is called) raise invalid_grant.
       5. Full suite at 100% coverage.
-      Stop with status=blocked if the SDK's /authorize handler does not call provider.authorize with the client's
-      redirect_uri already validated against its registered list, or if AuthorizationCode has no `subject` field.
+      Stop with status=blocked if the SDK's /authorize handler does not validate redirect_uri against the client's
+      registered list before calling provider.authorize, if the SDK follows the authorize() return value anywhere other
+      than as a 302 Location, or if AuthorizationCode has no `subject` field.
     acceptance:
       - python3 -m pytest tests/unit/test_token_store.py tests/unit/test_oauth_provider.py -q passes
       - python3 -m pytest -q --cov=src/html_artifact_deploy --cov-branch --cov-report=json:coverage.json && python3 scripts/check_coverage_floor.py coverage.json passes
-      - ruff check . && ruff format --check . && python3 scripts/mypy_strict_modules.py && bandit -q -c pyproject.toml -r src pass
+      - mypy --strict src/html_artifact_deploy/token_store.py src/html_artifact_deploy/oauth_provider.py passes
+      - ruff check . && ruff format --check . && bandit -q -c pyproject.toml -r src pass
 
   - id: p6-http-transport
     title: Streamable HTTP app, serve-http, check-config and token commands
@@ -1182,46 +1308,59 @@ phases:
       - src/html_artifact_deploy/http_app.py
       - src/html_artifact_deploy/__main__.py
       - pyproject.toml
+      - scripts/check_coverage_floor.py
       - tests/unit/test_http_app.py
       - tests/unit/test_main.py
       - tests/integration/test_http_contract.py
     brief: |
-      Read docs/publish-pages-plan.md sections D10 (AuthSettings), D11, D13 first; they are the spec.
+      Read docs/publish-pages-plan.md sections D2 (google_client_secret), D10 (auth_settings, START_PATH), D11, D13 first;
+      they are the spec. Do not edit CHANGELOG.md.
       1. pyproject.toml dependencies: add `"starlette>=1.0,<2.0"` and `"uvicorn>=0.30,<1.0"` below mcp, with the comment
-         `# Imported directly by http_app.py and __main__.py; mcp already installs both (ADR 0018).`
-         First confirm the installed versions fall in those ranges (`pip show starlette uvicorn`); if not, stop blocked.
-      2. Create src/html_artifact_deploy/http_app.py exactly as D11 (without uploads: pass `uploads=None` to AppContext;
-         p7 adds them). Use oauth_provider.auth_settings(http).
-      3. __main__.py: add the subcommands of D13 with argparse subparsers (`dest="command"`, not required, so no
-         subcommand = stdio): serve-http (build_http_app then _run_uvicorn), check-config, token create/list/revoke.
+         `# Imported directly by http_app.py and __main__.py; mcp already installs both (ADR 0019).` First confirm the
+         installed versions fall in those ranges (`pip show starlette uvicorn`); if not, stop blocked. Add
+         "html_artifact_deploy.google_oidc_client", "html_artifact_deploy.token_store", "html_artifact_deploy.oauth_provider",
+         "html_artifact_deploy.http_app" and "html_artifact_deploy.__main__" to the mypy override's module list.
+         scripts/check_coverage_floor.py: add token_store.py, oauth_provider.py and http_app.py at 100.0 with one-line
+         comments.
+      2. Create src/html_artifact_deploy/http_app.py exactly as D11, without uploads (AppContext has no uploads field yet;
+         p7 adds it). Register the START_PATH, CALLBACK_PATH and HEALTH_PATH custom routes before streamable_http_app.
+      3. __main__.py: add the subcommands of D13 with argparse subparsers (`dest="command"`, not required, so no subcommand
+         = stdio): serve-http (google_client_secret, build_http_app, then _run_uvicorn), check-config (load_config, the
+         store's check(), StateDB open, google_client_secret when [auth] is present), token create/list/revoke.
          `_run_uvicorn` exactly as D11 with `# pragma: no cover`.
-      4. tests/unit/test_http_app.py, via httpx2.ASGITransport with base_url=http.public_url (Host is checked, D11)
-         and the app's lifespan running: GET /healthz → 200 "ok"; GET
-         /.well-known/oauth-authorization-server → issuer equals http.public_url and registration_endpoint present;
-         GET /.well-known/oauth-protected-resource/mcp (or the path the SDK serves; read it from the SDK) names the
-         resource; POST /mcp without a token → 401; with an API token created via TokenStore → tools/list returns the
-         three page tools and server_info, and publish_page writes a file whose owner in the index is the token's
-         subject; a request with Host: evil.example → rejected (421 or 400, whatever the SDK returns); max_request_body_size
-         arithmetic; build_http_app raises ConfigError when [http] is missing.
-      5. tests/unit/test_main.py: check-config prints "Configuration OK: <path>" and returns 0, and returns 2 with a
-         bad file; token create prints only the token on stdout and the D13 notice on stderr; refused address → 2;
-         duplicate name → 2 with the D10 message; token list output format; token revoke → "Revoked." / "no such token." 1;
-         serve-http with _run_uvicorn monkeypatched records the app and the HttpConfig; serve-http without [http] → 2.
-      6. tests/integration/test_http_contract.py (marker `integration`): write a config (listen_port = a free port from
-         socket bind to 0; public_url f"http://127.0.0.1:{port}"; pages public_base_url "https://pages.example.com";
-         auth with allowed_domains ["example.com"], a fake client id "x.apps.googleusercontent.com"), create an API token
-         with `python -m html_artifact_deploy --config … token create --user a@example.com --name t` (subprocess), start
-         `python -m html_artifact_deploy --config … serve-http` as a subprocess with the secret in its env, poll /healthz
-         until 200 (at most 20 s, never a fixed sleep as the only wait), then `mcp.Client` over
-         streamable_http_client(f"http://127.0.0.1:{port}/mcp", http_client=httpx2.AsyncClient(headers={"Authorization":
-         f"Bearer {token}"})) lists tools and publishes a page whose file exists; terminate the subprocess in a finally.
-      7. Full suite at 100% coverage.
-      Stop with status=blocked if the SDK's streamable_http_app does not mount the OAuth routes when
-      auth_server_provider is set, or if stateless_http=True rejects authenticated requests.
+      4. tests/unit/test_http_app.py, via httpx2.ASGITransport with base_url=http.public_url (Host is checked, D11) inside
+         `async with app.router.lifespan_context(app):`: GET /healthz → 200 "ok"; GET /.well-known/oauth-authorization-server
+         → issuer equals http.public_url and registration_endpoint present; GET /.well-known/oauth-protected-resource/mcp
+         → resource equals public_url + "/mcp"; POST /mcp without a token → 401; with an API token from
+         TokenStore.create_api_token → tools/list returns the three page tools and server_info, and publish_page writes
+         a file whose index owner is the token's subject; with a valid token and header Host: evil.example → 421;
+         max_request_body_size arithmetic (small and large max_bytes); build_http_app raises ConfigError when [http] is
+         missing and when the secret variable is empty.
+      5. tests/unit/test_main.py: check-config prints "Configuration OK: <path>" and returns 0, returns 2 with a bad file,
+         and returns 2 when [auth] is present and the secret is unset; token create prints only the token on stdout and
+         the D13 notice on stderr, and works without the secret variable; a refused address → 2; a duplicate name → 2
+         with the D10 message; token list's line format; token revoke → "Revoked." (0) and "no such token." (1);
+         serve-http with _run_uvicorn monkeypatched records the app and the HttpConfig; serve-http without [http] → 2;
+         serve-http without the secret → 2.
+      6. tests/integration/test_http_contract.py (marker `integration`, `@pytest.mark.timeout(60)`): write a config
+         (listen_port = a free port from binding a socket to port 0; public_url f"http://127.0.0.1:{port}"; pages
+         public_base_url "https://pages.example.com"; auth with allowed_domains ["example.com"] and client id
+         "x.apps.googleusercontent.com"); create an API token with `python -m html_artifact_deploy --config … token create
+         --user a@example.com --name t` (subprocess, no secret needed); start `python -m html_artifact_deploy --config …
+         serve-http` as a subprocess with HTML_ARTIFACT_DEPLOY_GOOGLE_CLIENT_SECRET=x in its env; poll /healthz every
+         0.2 s until 200 (at most 20 s); then `mcp.Client` over streamable_http_client(f"http://127.0.0.1:{port}/mcp",
+         http_client=httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"})) lists tools and publishes a page
+         whose file exists; terminate the subprocess in a finally and assert nothing it printed contains the token.
+      7. Full suite at 100% coverage. Dispatch build.yml against this phase branch (a runtime dependency changed; definition
+         of done) and put the run URL and result in the PHASE-REPORT.
+      Stop with status=blocked if streamable_http_app does not mount the OAuth routes when auth_server_provider is set,
+      or if stateless_http=True rejects authenticated requests.
     acceptance:
       - python3 -m pytest tests/unit/test_http_app.py tests/unit/test_main.py tests/integration -q passes
       - python3 -m pytest -q --cov=src/html_artifact_deploy --cov-branch --cov-report=json:coverage.json && python3 scripts/check_coverage_floor.py coverage.json passes
+      - python3 scripts/mypy_strict_modules.py --list | grep -c "src/html_artifact_deploy/" prints 12
       - grep -c "pragma: no cover" src/html_artifact_deploy/__main__.py prints 2
+      - build.yml dispatched against the phase branch is green (run URL in PHASE-REPORT)
       - ruff check . && ruff format --check . && python3 scripts/mypy_strict_modules.py && bandit -q -c pyproject.toml -r src pass
 
   - id: p7-uploads
@@ -1232,35 +1371,45 @@ phases:
       - src/html_artifact_deploy/uploads.py
       - src/html_artifact_deploy/server.py
       - src/html_artifact_deploy/http_app.py
+      - pyproject.toml
+      - scripts/check_coverage_floor.py
       - tests/unit/test_uploads.py
       - tests/unit/test_server.py
       - tests/unit/test_http_app.py
     brief: |
-      Read docs/publish-pages-plan.md sections D7 (check_can_publish), D8 (publish_page upload flow, create_page_upload), D11, D12 first; they are the spec.
-      1. Create src/html_artifact_deploy/uploads.py exactly as D12. Blocking database and file work goes through
-         asyncio.to_thread; the PUT handler streams with `async for chunk in request.stream()` and writes each chunk
-         through to_thread.
-      2. server.py: type AppContext.uploads as `UploadStore | None`; implement the upload branch of publish_page exactly
-         as D8 (check_can_publish → read → publish → discard; UploadError → ToolError); register create_page_upload with
-         D8's docstring and annotations only when app.uploads is not None. Its result: upload_id, upload_url,
-         method "PUT", max_bytes, expires_at (ISO).
-      3. http_app.py: build the UploadStore as D12 says, pass it in AppContext, register the PUT custom route.
-      4. Tests:
-         - tests/unit/test_uploads.py: create → PUT (via the Starlette app from build_http_app and httpx2.ASGITransport, or
-           a minimal Starlette app with just the route) → read → discard; unknown id 404; second PUT to a filled slot 404;
-           expired slot (injected clock) 404 and not readable; Content-Length over the limit 413; a body over the limit
-           without Content-Length (a streamed generator body) 413 and no file left behind; empty body 400; read by another
-           owner → UploadError with D12's message; the upload folder is 0o700 (skip on win32); expired rows and files purged
-           on create.
+      Read docs/publish-pages-plan.md sections D7 (check_can_publish), D8 (publish_page upload flow, create_page_upload),
+      D11, D12 first; they are the spec. Do not edit CHANGELOG.md.
+      1. Create src/html_artifact_deploy/uploads.py exactly as D12. Database and file work goes through asyncio.to_thread;
+         handle_put reads with `async for chunk in request.stream()` and writes each chunk through to_thread.
+      2. server.py: add `uploads: UploadStore | None = None` to AppContext; implement the upload branch of publish_page
+         exactly as D8 (check_can_publish → read → publish → discard; UploadError → ToolError); register
+         create_page_upload with D8's docstring and annotations only when app.uploads is not None. Its result: upload_id,
+         upload_url, method "PUT", max_bytes, expires_at (ISO).
+      3. http_app.py: build the UploadStore as D12 says, pass it in AppContext, and register the PUT custom route before
+         streamable_http_app is called.
+      4. pyproject.toml: add "html_artifact_deploy.uploads" to the mypy override's module list. scripts/check_coverage_floor.py:
+         add uploads.py at 100.0 with a one-line comment.
+      5. Tests (all HTTP through build_http_app's app, httpx2.ASGITransport, base_url=http.public_url, inside the lifespan
+         context, with a stub GoogleOidcClient passed as `google=`):
+         - tests/unit/test_uploads.py: create → PUT → read → discard; unknown id 404; a second PUT to a filled slot 404;
+           an expired slot (injected clock) 404 and not readable; Content-Length over the limit 413; a streamed body over
+           the limit without Content-Length (an async generator body) 413 and no file left in the folder; empty body 400;
+           read by another owner → UploadError with D12's message; the eleventh open slot → UploadError with D12's
+           message; the upload folder is 0o700; expired rows, their files and stale `.part` files are purged on create;
+           the losing side of a concurrent fill (mark the row filled directly before handle_put's UPDATE runs, via
+           monkeypatch) gets 404 and leaves no file.
          - tests/unit/test_server.py: with an UploadStore in AppContext the tool list includes create_page_upload with D8's
            annotations; publish via upload_id works and discards the upload (a second publish with the same id fails with
            the UploadError message); a bad title with upload_id does not consume the upload; without an UploadStore the
            tool is absent and upload_id still gives the "not available" error.
-         - tests/unit/test_http_app.py: the upload route is reachable without a bearer token and /mcp is not.
-      5. Full suite at 100% coverage.
+         - tests/unit/test_http_app.py: the upload route answers without a bearer token and /mcp does not.
+      6. Full suite at 100% coverage.
+      Stop with status=blocked if Starlette buffers the whole request body before handle_put runs (the streamed 413 test
+      then shows the full body read), or if custom routes cannot take a `{upload_id}` path parameter.
     acceptance:
       - python3 -m pytest tests/unit/test_uploads.py tests/unit/test_server.py tests/unit/test_http_app.py -q passes
       - python3 -m pytest -q --cov=src/html_artifact_deploy --cov-branch --cov-report=json:coverage.json && python3 scripts/check_coverage_floor.py coverage.json passes
+      - python3 scripts/mypy_strict_modules.py --list | grep -c "src/html_artifact_deploy/" prints 13
       - ruff check . && ruff format --check . && python3 scripts/mypy_strict_modules.py && bandit -q -c pyproject.toml -r src pass
 
   - id: p8-deployment-docs
@@ -1276,23 +1425,26 @@ phases:
       - README.md
       - tests/unit/test_deploy_files.py
     brief: |
-      Read docs/publish-pages-plan.md sections D2, D11, D13, D14, D15 first; they are the spec. Standing docs describe
-      current behaviour only: no plan, phase or ADR-number-less history (ADR 0008); cite ADRs 0010–0018 by number
-      where a "why" is needed (they are written in the last phase; citing their numbers now is fine).
+      Read docs/publish-pages-plan.md sections D2, D11, D12, D13, D14, D15 first; they are the spec. Do not edit
+      CHANGELOG.md. Standing docs describe today's behaviour only, with no project history (ADR 0008); where a "why" is
+      needed, cite ADRs 0011–0019 by number (p9 writes them; their numbers are fixed by the plan's ADRs section).
       1. deploy/html-artifact-deploy.service and deploy/Caddyfile.example exactly as D14.
-      2. docs/deployment.md: the D14 walkthrough, numbered, every command in a code block, with the Google Cloud console
-         links https://console.cloud.google.com/auth/branding and https://console.cloud.google.com/auth/clients.
-         It covers create_page_upload's size limit and that uploads need Claude Code (or anything that can PUT).
-      3. docs/configuration.md: one table per section of D2 (key, type, required/default, meaning) plus the environment
-         variables (HTML_ARTIFACT_DEPLOY_CONFIG, the client-secret variable) and the D13 commands.
+      2. docs/deployment.md: the D14 walkthrough, numbered, every command in a code block. Google steps link
+         https://console.cloud.google.com/auth/branding, https://console.cloud.google.com/auth/audience (choose Internal)
+         and https://console.cloud.google.com/auth/clients/create. Commands that touch state.dir run as the service user
+         exactly as D13 says. It covers create_page_upload's size limit, and that uploads need a client that can make an
+         HTTP PUT (Claude Code).
+      3. docs/configuration.md: one table per section of D2 (key, type, required/default, meaning), the environment
+         variables (HTML_ARTIFACT_DEPLOY_CONFIG and the client-secret variable) and the D13 commands.
       4. docs/README.md: add deployment.md and configuration.md under "Using HTML Artifact Deploy".
       5. README.md: rewrite "Connect a client" as D15 (four subsections), add a short "Run your own server" paragraph
          linking docs/deployment.md, and add a create_page_upload row to the tool table ("HTTP only").
-      6. tests/unit/test_deploy_files.py (marker `unit`): every key in deploy/config.example.toml appears as `section.key`
-         or in its section's table in docs/configuration.md (parse the TOML, then search the doc text for each key);
-         the Caddyfile's pages site contains the exact Content-Security-Policy value from D14 and no `browse`; the
-         systemd unit contains ExecStart with `serve-http`, EnvironmentFile, ReadWritePaths=/srv/pages, NoNewPrivileges=yes.
+      6. tests/unit/test_deploy_files.py (marker `unit`): every key in deploy/config.example.toml appears in
+         docs/configuration.md (parse the TOML, then search the doc text for each `key`); the Caddyfile's pages site
+         contains the exact Content-Security-Policy value from D14 and no `browse`; the systemd unit contains ExecStart with
+         `serve-http`, EnvironmentFile, ReadWritePaths=/srv/pages and NoNewPrivileges=yes.
       7. python3 -m pytest tests/unit/test_no_project_history.py -q must pass.
+      Stop with status=blocked if a D13 command or a D2 key the docs must describe does not exist in the code as merged.
     acceptance:
       - python3 -m pytest tests/unit/test_deploy_files.py tests/unit/test_no_project_history.py -q passes
       - grep -c "Content-Security-Policy \"sandbox allow-scripts" deploy/Caddyfile.example prints 1
@@ -1300,19 +1452,19 @@ phases:
       - python3 -m pytest -q passes
 
   - id: p9-adrs-and-retire
-    title: ADRs 0010–0018, changelog, reference-doc touch-ups, delete the plan
+    title: ADRs 0011–0019, changelog, reference-doc touch-ups, delete the plan
     depends_on: [p7-uploads, p8-deployment-docs]
     complexity: M
     touches:
-      - docs/adr/0010-a-standalone-server-that-writes-into-the-web-servers-folder.md
-      - docs/adr/0011-pages-are-served-from-a-separate-sandboxed-host-name.md
-      - docs/adr/0012-a-page-link-is-a-random-id-plus-a-slug-and-ownership-is-an-index.md
-      - docs/adr/0013-the-server-is-its-own-oauth-server-and-google-only-proves-identity.md
-      - docs/adr/0014-client-registration-accepts-only-allowlisted-redirect-uris.md
-      - docs/adr/0015-google-id-tokens-are-trusted-by-tls-not-by-signature.md
-      - docs/adr/0016-all-state-is-one-sqlite-file.md
-      - docs/adr/0017-large-pages-arrive-through-one-time-upload-urls.md
-      - docs/adr/0018-streamable-http-is-stateless-and-starlette-and-uvicorn-are-declared.md
+      - docs/adr/0011-a-standalone-server-that-writes-into-the-web-servers-folder.md
+      - docs/adr/0012-pages-are-served-from-a-separate-sandboxed-host-name.md
+      - docs/adr/0013-a-page-link-is-a-random-id-plus-a-slug-and-ownership-is-an-index.md
+      - docs/adr/0014-the-server-is-its-own-oauth-server-and-google-only-proves-identity.md
+      - docs/adr/0015-client-registration-accepts-only-allowlisted-redirect-uris.md
+      - docs/adr/0016-google-id-tokens-are-trusted-by-tls-not-by-signature.md
+      - docs/adr/0017-all-state-is-one-sqlite-file.md
+      - docs/adr/0018-large-pages-arrive-through-one-time-upload-urls.md
+      - docs/adr/0019-streamable-http-is-stateless-and-starlette-and-uvicorn-are-declared.md
       - docs/adr/README.md
       - docs/live-qa.md
       - docs/testing-policy.md
@@ -1320,28 +1472,29 @@ phases:
       - docs/publish-pages-plan.md
       - docs/publish-pages-plan-manual-steps.html
     brief: |
-      1. Write ADRs 0010–0018 from the plan's "ADRs" list, using docs/adr/README.md's template. Context and Decision come
-         from the matching D-section; "Alternatives considered" from the plan's "Rejected alternatives" bullets that
-         belong to that decision; Verification names the enforcing files and tests (for example 0011 → config.py's
-         host check and tests/unit/test_config.py, deploy/Caddyfile.example and tests/unit/test_deploy_files.py).
-         Status `Accepted — <today's date>.` Related: link source files and ADR 0003/0007 where relevant; never the
-         plan (it is being deleted; cite it, if at all, as `git show <sha>^:docs/publish-pages-plan.md` with the SHA of
-         this phase's commit that deletes it, which you can only know after committing, so do not cite it).
+      1. Write ADRs 0011–0019 from the plan's "ADRs" list, with the file names in `touches` and docs/adr/README.md's
+         template. Context and Decision come from the matching D-section; "Alternatives considered" from the plan's
+         "Rejected alternatives" bullets for that decision; Verification names the enforcing files and tests (for example
+         0012 → config.py's host check and tests/unit/test_config.py, deploy/Caddyfile.example and
+         tests/unit/test_deploy_files.py). Status `Accepted — <today's date>.` Related: source files, and ADRs 0003,
+         0007 and 0010 where relevant; never the plan document.
       2. docs/adr/README.md: add the nine rows to the index.
-      3. docs/live-qa.md: add a short section saying the google_openid_configuration check needs no QA account or
-         credentials, so it can run anywhere (still weekly on the runner with the others).
+      3. docs/live-qa.md: a short section saying the google_openid_configuration check needs no QA account or
+         credentials, so it can run anywhere (it still runs weekly on the runner with the others).
       4. docs/testing-policy.md: in "Layer 5", one sentence naming google_openid_configuration as the only live check and
          what it guards (Google's authorization and token endpoints).
-      5. CHANGELOG.md under ## [Unreleased] ### Added, replacing the skeleton line: publish/list/unpublish tools;
-         Google Workspace sign-in for claude.ai, Claude Desktop and Claude Code over Streamable HTTP; API tokens;
-         create_page_upload; stdio with --config; the deploy/ examples and guides. ### Removed: the placeholder echo tool.
+      5. CHANGELOG.md under ## [Unreleased]: ### Added, replacing the skeleton line: the publish_page, list_pages and
+         unpublish_page tools; Google Workspace sign-in for claude.ai, Claude Desktop and Claude Code over Streamable
+         HTTP; API tokens; create_page_upload; stdio with --config; the deploy/ examples and the deployment and
+         configuration guides. ### Removed: the placeholder echo tool.
       6. git rm docs/publish-pages-plan.md docs/publish-pages-plan-manual-steps.html; grep -rn "publish-pages-plan" .
          --exclude-dir=.git must return nothing.
-      7. Dispatch build.yml against feature/publish-pages is the orchestrator's final check; in this phase dispatch it
-         against this phase branch and report the run.
+      7. Dispatch build.yml against this phase branch and report the run.
+      Stop with status=blocked if an ADR number 0011–0019 is already taken on main when you start (renumbering is then
+      the orchestrator's call, since p8's docs cite the numbers).
     acceptance:
-      - ls docs/adr/00{10,11,12,13,14,15,16,17,18}-*.md lists nine files
-      - grep -c "^| \[001[0-8]\]" docs/adr/README.md prints 9
+      - ls docs/adr/00{11,12,13,14,15,16,17,18,19}-*.md lists nine files
+      - grep -cE "^\| \[00(1[1-9])\]" docs/adr/README.md prints 9
       - test ! -e docs/publish-pages-plan.md && test ! -e docs/publish-pages-plan-manual-steps.html
       - grep -rn "publish-pages-plan" . --exclude-dir=.git returns nothing
       - python3 -m pytest -q passes (including test_no_project_history)
