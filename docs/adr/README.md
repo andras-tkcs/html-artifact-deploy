@@ -117,3 +117,4 @@ until a later ADR supersedes it.
 | [0007](0007-live-upstream-credentials-only-on-a-self-hosted-runner.md) | Live upstream credentials exist only on a self-hosted runner | Accepted |
 | [0008](0008-code-and-docs-carry-no-project-history.md) | Code and standing docs carry no project history | Accepted |
 | [0009](0009-pypi-publishing-uses-trusted-publishing-only.md) | PyPI publishing uses OIDC trusted publishing only | Accepted |
+| [0010](0010-the-server-runs-on-headless-linux-only.md) | The server runs on headless Linux only; CI tests no other OS | Accepted |
