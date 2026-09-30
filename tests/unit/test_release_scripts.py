@@ -71,7 +71,10 @@ class TestChangelogSection:
     def test_populated_unreleased_fails_the_cli(self, tmp_path: Path) -> None:
         """Entries stranded in [Unreleased] would be missing from the release notes."""
         path = tmp_path / "CHANGELOG.md"
-        path.write_text(CHANGELOG.replace("## [Unreleased]\n", "## [Unreleased]\n\n- Pending.\n"))
+        path.write_text(
+            CHANGELOG.replace("## [Unreleased]\n", "## [Unreleased]\n\n- Pending.\n"),
+            encoding="utf-8",
+        )
         assert changelog_section.main(["1.1.0", "--changelog", str(path)]) == 1
         assert changelog_section.main(["1.1.0", "--changelog", str(path), "--allow-unreleased"]) == 0
 

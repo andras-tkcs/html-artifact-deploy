@@ -27,7 +27,7 @@ behind that makes later checks lie.
 **Then pre-flight `build.yml` against that same commit — do not skip this** (ADR 0006).
 `release.yml` builds nothing, so it cannot catch a regression in the packaged smoke test. Dispatch
 `.github/workflows/build.yml` (`workflow_dispatch`, no inputs) against `origin/main`'s exact commit
-and wait for `build` and every `smoke` leg to finish. Every publish job is gated on a tag ref, so
+and wait for `build` and `smoke` to finish. Every publish job is gated on a tag ref, so
 this run publishes nothing. Report the run URL and its outcome.
 
 If any of them fail: stop. Treat it as an ordinary CI failure on `main` — diagnose, fix, push, and

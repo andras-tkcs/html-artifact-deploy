@@ -15,6 +15,8 @@ authors = [{ name = "AT", email = "at+github@felhasznalo.name" }]
 keywords = ["mcp", "model-context-protocol"]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Environment :: No Input/Output (Daemon)",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",

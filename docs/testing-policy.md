@@ -19,7 +19,7 @@ the markers; a new test module carries the marker of its layer.
 |---|---|---|---|---|
 | 1 | Unit | Logic in isolation, offline; every tool through the in-process MCP client | `unit` | `tests.yml`, every PR |
 | 2 | Integration | The real server process over the real transport (stdio; Streamable HTTP if served), driven by the official MCP client | `integration` | `tests.yml`, every PR |
-| 3 | Compatibility | The suite on every supported Python version and OS | (none; a matrix) | `tests.yml`, every PR |
+| 3 | Compatibility | The suite on every supported Python version, on Linux only (ADR 0010) | (none; a matrix) | `tests.yml`, every PR |
 | 4 | Client contract | A real, pinned AI-client CLI configured against the server the way the README says, reporting it connected | `client` | `tests.yml`, every PR, once added |
 | 5 | Live upstream | The upstream API still answers in the shape the fixtures record | `live` | `live-check.yml`, self-hosted runner, weekly |
 | 6 | Packaged artifact | The built wheel installs into a clean environment and its entry point speaks MCP | `packaged` | `build.yml` |
@@ -29,7 +29,7 @@ the markers; a new test module carries the marker of its layer.
 |---|---|
 | Wrong logic or malformed output from a function or tool | 1 |
 | A stray `print` on stdout, a crash at start-up, a broken entry point | 2 |
-| Works on 3.13 / Linux, breaks on 3.11 or Windows | 3 |
+| Works on 3.13, breaks on 3.11 | 3 |
 | A client version stops accepting the server's configuration or tool schemas | 4 |
 | The upstream service renamed a field or changed a response | 5 |
 | The wheel is missing a file, or its dependencies do not resolve | 6 |
@@ -44,7 +44,6 @@ and on dispatch. A 100% pass rate is required to merge.
 |---|---|
 | `test` (Ubuntu, Python 3.13) | The full suite with branch coverage; `scripts/check_coverage_floor.py coverage.json`; uploads `coverage-report` |
 | `Test (Python 3.x)` | The suite on the other supported Python versions, one check each |
-| `Test (windows-latest)`, `Test (macos-latest)` | The suite on Windows and macOS (not required checks by default; see the workflow's comment) |
 | `static-analysis` | `ruff check .`, `ruff format --check .`, `bandit`, `scripts/mypy_strict_modules.py` (all blocking); whole-tree `mypy` (informational) |
 
 **Coverage is a ratchet.** `scripts/check_coverage_floor.py` fails if overall coverage, or any

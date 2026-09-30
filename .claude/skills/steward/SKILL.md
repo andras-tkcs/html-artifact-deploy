@@ -13,17 +13,17 @@ being asked.
 
 ## Work that has to leave this machine
 
-A Claude Code on the web container has no macOS or Windows, and — by deliberate policy, not by
-oversight — no live upstream credentials (ADR 0007). None of that is a reason to skip a checklist
-row. Each of those jobs exists as a workflow with `workflow_dispatch`, and a session can dispatch
-it **against its own branch** and read the result back.
+A Claude Code on the web container has — by deliberate policy, not by oversight — no live
+upstream credentials (ADR 0007). That is not a reason to skip a checklist row. Each of those jobs
+exists as a workflow with `workflow_dispatch`, and a session can dispatch it **against its own
+branch** and read the result back.
 
 | You need | Dispatch | Notes |
 |---|---|---|
 | A fixture for a newly added upstream endpoint | `qa-record-fixture.yml` | Input `name`, a key of `CHECKS` in `scripts/live_check.py`. Runs on the self-hosted runner and **commits the fixture back to the branch it was dispatched against** — pull before you continue. See `/qa-record`. |
 | A `live_check.py --check` report for the definition of done | `live-check.yml` | No inputs. Link the run in the PR rather than pasting nothing. |
-| The built wheel, and its packaged smoke test on Linux, Windows and macOS | `build.yml` | No inputs. Publishes nothing off a tag. |
-| Cross-platform or cross-version `pytest` | — | Don't dispatch. `tests.yml` already runs every leg on every PR; read the failing job's log instead of guessing. |
+| The built wheel, and its packaged smoke test | `build.yml` | No inputs. Publishes nothing off a tag. |
+| Cross-version `pytest` | — | Don't dispatch. `tests.yml` already runs every leg on every PR; read the failing job's log instead of guessing. |
 | To cut a release tag | `release.yml` | Inputs `version` and `dry_run`. **`dry_run` defaults to true** — dispatch it that way first. Only cut for real when the maintainer has seen the dry run and said to. See `/cut-release`. |
 
 Things about dispatching, so they are not rediscovered at runtime:

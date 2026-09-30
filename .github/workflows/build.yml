@@ -64,12 +64,8 @@ jobs:
   # installed entry point speaks MCP over stdio.
   smoke:
     needs: build
-    name: Packaged smoke (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+    name: Packaged smoke
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -83,7 +79,7 @@ jobs:
         shell: bash
         run: |
           python -m venv "$RUNNER_TEMP/pkg"
-          if [ -x "$RUNNER_TEMP/pkg/bin/python" ]; then PY="$RUNNER_TEMP/pkg/bin/python"; else PY="$RUNNER_TEMP/pkg/Scripts/python.exe"; fi
+          PY="$RUNNER_TEMP/pkg/bin/python"
           "$PY" -m pip install dist/*.whl pytest pytest-asyncio pytest-timeout
           echo "PKG_PY=$PY" >> "$GITHUB_ENV"
       - name: Run the packaged smoke test

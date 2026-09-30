@@ -80,8 +80,8 @@ no section of their own; they fold into the version they lead to, and their GitH
 A `v*` tag push starts `.github/workflows/build.yml`:
 
 1. **`build`** — builds the sdist and wheel.
-2. **`smoke`** — installs the wheel into a clean virtual environment on each OS and runs the
-   `packaged` smoke test against the installed entry point.
+2. **`smoke`** — installs the wheel into a clean virtual environment on Linux (ADR 0010) and runs
+   the `packaged` smoke test against the installed entry point.
 3. **`publish-testpypi`**, then **`publish-pypi`** — stable tags only, each gated on the one
    before, so a broken upload never reaches the real index.
 4. **`github-release`** — creates the GitHub Release with the built files; for a stable tag the
