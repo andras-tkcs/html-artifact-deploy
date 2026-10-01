@@ -16,7 +16,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import DEFAULT_MAX_REQUEST_BODY_SIZE
 from starlette.applications import Starlette
 
-from html_artifact_deploy.config import AuthConfig, Config, ConfigError, HttpConfig, PagesConfig
+from html_artifact_deploy.config import AuthConfig, Config, ConfigError, FetchConfig, HttpConfig, PagesConfig
 from html_artifact_deploy.http_app import _owner, build_http_app, max_request_body_size
 from html_artifact_deploy.oauth_provider import START_PATH
 from html_artifact_deploy.state import DB_FILE_NAME, StateDB
@@ -30,7 +30,7 @@ ENVIRON = {SECRET_ENV: "secret"}
 ACCEPT = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
 
 
-def _config(tmp_path: Path, *, http: bool = True) -> Config:
+def _config(tmp_path: Path, *, http: bool = True, fetch: bool = False) -> Config:
     pages = tmp_path / "pages"
     pages.mkdir(exist_ok=True)
     return Config(
@@ -43,6 +43,7 @@ def _config(tmp_path: Path, *, http: bool = True) -> Config:
             allowed_domains=("example.com",),
             allowed_emails=(),
         ),
+        fetch=FetchConfig(allowed_hosts=("raw.example.com",)) if fetch else None,
     )
 
 
@@ -132,6 +133,14 @@ class TestUploadRoute:
 
 
 class TestMcp:
+    @pytest.mark.parametrize("fetch", [False, True])
+    async def test_publish_page_from_url_is_listed_only_with_a_fetch_section(self, tmp_path: Path, fetch: bool) -> None:
+        app = build_http_app(_config(tmp_path, fetch=fetch), environ=ENVIRON)
+        async with _client(app, _token(tmp_path)) as client:
+            tools = await client.post("/mcp", json=_rpc("tools/list"))
+        names = {tool["name"] for tool in tools.json()["result"]["tools"]}
+        assert ("publish_page_from_url" in names) is fetch
+
     async def test_no_token_is_401(self, tmp_path: Path) -> None:
         async with _client(build_http_app(_config(tmp_path), environ=ENVIRON)) as client:
             response = await client.post("/mcp", json=_rpc("initialize", _INIT))

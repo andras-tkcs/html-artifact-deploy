@@ -11,6 +11,7 @@ from mcp.server.mcpserver import MCPServer
 from html_artifact_deploy import __main__ as entry
 from html_artifact_deploy import __version__
 from html_artifact_deploy.config import HttpConfig
+from html_artifact_deploy.server import AppContext
 
 pytestmark = pytest.mark.unit
 
@@ -22,14 +23,16 @@ AUTH_SECTIONS = (
 )
 
 
-def _write_config(tmp_path: Path, *, pages: Path | None = None, auth: bool = False) -> Path:
+def _write_config(tmp_path: Path, *, pages: Path | None = None, auth: bool = False, fetch: bool = False) -> Path:
     root = pages if pages is not None else tmp_path / "pages"
     if pages is None:
         root.mkdir()
     path = tmp_path / "config.toml"
     path.write_text(
         f'[pages]\nroot = "{root}"\npublic_base_url = "https://pages.example.com"\n'
-        f'[state]\ndir = "{tmp_path / "state"}"\n' + (AUTH_SECTIONS if auth else ""),
+        f'[state]\ndir = "{tmp_path / "state"}"\n'
+        + (AUTH_SECTIONS if auth else "")
+        + ('[fetch]\nallowed_hosts = ["raw.example.com"]\n' if fetch else ""),
         encoding="utf-8",
     )
     return path
@@ -81,6 +84,20 @@ class TestMain:
         monkeypatch.setattr(MCPServer, "run", lambda self, transport: transports.append(transport))
         assert entry.main(["--config", str(_write_config(tmp_path))], {}) == 0
         assert transports == ["stdio"]
+
+    @pytest.mark.parametrize("fetch", [False, True])
+    def test_stdio_passes_the_fetcher_only_with_a_fetch_section(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fetch: bool
+    ) -> None:
+        contexts: list[AppContext] = []
+
+        def fake_build_server(app: AppContext) -> Any:
+            contexts.append(app)
+            return type("S", (), {"run": lambda self, transport: None})()
+
+        monkeypatch.setattr(entry, "build_server", fake_build_server)
+        assert entry.main(["--config", str(_write_config(tmp_path, fetch=fetch))], {}) == 0
+        assert (contexts[0].fetcher is not None) is fetch
 
     def test_environ_defaults_to_os_environ(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         transports: list[str] = []

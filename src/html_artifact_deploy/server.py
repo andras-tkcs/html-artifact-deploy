@@ -22,7 +22,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from . import __version__
-from .service import PageError, PageService
+from .fetch_client import FetchClient, FetchClientError
+from .service import PageError, PageService, PublishResult
 from .uploads import UploadError, UploadStore
 
 SERVER_NAME = "html-artifact-deploy"
@@ -33,10 +34,24 @@ class AppContext:
     service: PageService
     owner: Callable[[], str]  # who is calling; raises ToolError("Not signed in.") if unknown
     uploads: UploadStore | None = None  # None over stdio, where there is no URL to PUT to
+    fetcher: FetchClient | None = None  # None without [fetch]
 
 
 def _iso(timestamp: int) -> str:
     return datetime.fromtimestamp(timestamp, UTC).isoformat(timespec="seconds")
+
+
+def _publish_result(result: PublishResult) -> dict[str, object]:
+    record = result.record
+    return {
+        "page_id": record.page_id,
+        "url": result.url,
+        "title": record.title,
+        "bytes": record.bytes,
+        "created": result.created,
+        "updated_at": _iso(record.updated_at),
+        "expires_at": _iso(record.expires_at),
+    }
 
 
 def build_server(
@@ -62,7 +77,8 @@ def build_server(
 
         Pass the whole HTML document as html, with CSS and scripts inline or loaded from public CDNs.
         For a page over about 100 KB, when create_page_upload is available, upload the file first and
-        pass upload_id instead. Returns page_id, url, title, bytes, created (false when an existing page
+        pass upload_id instead. If the page is already online, publish_page_from_url (when available)
+        fetches it from its address instead. Returns page_id, url, title, bytes, created (false when an existing page
         was replaced), updated_at and expires_at. Give url to the user: anyone with that link can open
         the page until it expires. To change a page you published, call this again with its page_id;
         the page is replaced and keeps its url. Use list_pages to find a page_id, and unpublish_page to
@@ -92,16 +108,7 @@ def build_server(
                 result = await app.service.publish(owner, title, html.encode("utf-8"), page_id)
         except (PageError, UploadError) as error:
             raise ToolError(str(error)) from error
-        record = result.record
-        return {
-            "page_id": record.page_id,
-            "url": result.url,
-            "title": record.title,
-            "bytes": record.bytes,
-            "created": result.created,
-            "updated_at": _iso(record.updated_at),
-            "expires_at": _iso(record.expires_at),
-        }
+        return _publish_result(result)
 
     @server.tool(
         annotations=ToolAnnotations(
@@ -193,6 +200,43 @@ def build_server(
                 "max_bytes": slot.max_bytes,
                 "expires_at": _iso(slot.expires_at),
             }
+
+    fetcher = app.fetcher
+    if fetcher is not None:
+
+        @server.tool(
+            annotations=ToolAnnotations(
+                title="Publish HTML page from URL",
+                read_only_hint=False,
+                destructive_hint=False,
+                idempotent_hint=False,
+                open_world_hint=True,
+            )
+        )
+        async def publish_page_from_url(title: str, url: str, page_id: str = "") -> dict[str, object]:
+            """Publish a single-file HTML page that is already online, by its https address, and return its link.
+
+            The server downloads the file itself, so the page does not have to pass through this
+            conversation; use it for large pages. The address must be on a host this server allows (an error
+            names them) and must return the file to a plain GET with no sign-in, for example a raw file on a
+            Git host or a presigned storage link. Returns page_id, url, title, bytes, created, updated_at
+            and expires_at, as publish_page does. To change a page you published, pass its page_id; the page
+            is replaced and keeps its url. For a page you have as text, use publish_page.
+
+            Args:
+                title: What the page is, in words, for example "Q3 report". 1 to 200 characters. It is
+                    shown in list_pages only; the link is a random id and never contains it.
+                url: The https address of the HTML file.
+                page_id: The page_id of a page you published, to replace it. Empty to publish a new page.
+            """
+            owner = app.owner()
+            try:
+                await app.service.check_can_publish(owner, title, page_id)
+                data = await fetcher.fetch(url)
+                result = await app.service.publish(owner, title, data, page_id)
+            except (PageError, FetchClientError) as error:
+                raise ToolError(str(error)) from error
+            return _publish_result(result)
 
     @server.tool()
     def server_info() -> dict[str, str]:

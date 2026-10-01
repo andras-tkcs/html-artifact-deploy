@@ -21,6 +21,7 @@ from .config import (
     require_http,
     resolve_config_path,
 )
+from .fetch_client import FetchClient
 from .http_app import build_http_app
 from .page_index import PageIndex
 from .server import AppContext, build_server
@@ -89,7 +90,8 @@ def _stdio(config: Config) -> int:
     store.check()
     index = PageIndex(StateDB(config.state_dir / DB_FILE_NAME))
     service = PageService(config.pages, store, index)
-    build_server(AppContext(service, owner=lambda: config.stdio_user)).run("stdio")
+    fetcher = FetchClient(config.fetch, config.pages.max_bytes) if config.fetch is not None else None
+    build_server(AppContext(service, owner=lambda: config.stdio_user, fetcher=fetcher)).run("stdio")
     return 0
 
 
