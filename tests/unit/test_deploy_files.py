@@ -43,7 +43,7 @@ def test_service_unit_runs_serve_http_with_hardening() -> None:
     text = (DEPLOY / "html-artifact-deploy.service").read_text(encoding="utf-8")
     exec_start = next(line for line in text.splitlines() if line.startswith("ExecStart="))
     assert "serve-http" in exec_start
-    for line in ("EnvironmentFile=", "ReadWritePaths=/srv/pages", "NoNewPrivileges=yes"):
+    for line in ("EnvironmentFile=", "ReadWritePaths=/srv/pages", "NoNewPrivileges=yes", "StateDirectoryMode=0700"):
         assert line in text
 
 
@@ -64,5 +64,6 @@ def test_purge_timer_is_hourly_and_service_is_oneshot() -> None:
     service = (DEPLOY / "html-artifact-deploy-purge.service").read_text(encoding="utf-8")
     assert "OnCalendar=hourly" in timer
     assert "Type=oneshot" in service
+    assert "StateDirectoryMode=0700" in service
     exec_start = next(line for line in service.splitlines() if line.startswith("ExecStart="))
     assert "purge-expired" in exec_start

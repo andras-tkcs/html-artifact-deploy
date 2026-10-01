@@ -1,6 +1,7 @@
 """The Streamable HTTP application: the tools behind sign-in, host checks and a body limit.
 
-`build_http_app` wires the OAuth authorization server (`oauth_provider.py`), the three page tools
+`build_http_app` wires the OAuth authorization server (`oauth_provider.py`), the page tools
+(publishing, listing, unpublishing, extending expiry and the upload and fetch routes for large pages)
 and a health route into one ASGI app. MCP sessions are stateless and answers are plain JSON, so a
 restart loses nothing and no server-to-client stream has to stay open behind the reverse proxy.
 """

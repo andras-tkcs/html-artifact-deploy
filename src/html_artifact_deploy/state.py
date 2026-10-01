@@ -56,6 +56,7 @@ def secret_hash(value: str) -> str:
 class StateDB:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path.parent, 0o700)  # mkdir leaves an existing folder (systemd creates it 0755) as it is
         self._lock = threading.Lock()
         self._connection = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._connection.row_factory = sqlite3.Row

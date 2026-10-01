@@ -1,6 +1,7 @@
 """The MCP server: its tools, and the factory every transport and test builds it from.
 
-The page tools (`publish_page`, `list_pages`, `unpublish_page`) act for the caller named by
+The page tools (`publish_page`, `list_pages`, `unpublish_page`, `extend_page_expiry`,
+`create_page_upload` and `publish_page_from_url`) act for the caller named by
 `AppContext.owner`: stdio supplies a fixed name from the configuration, and a networked transport
 supplies the signed-in person. The tools never take an owner from their arguments.
 

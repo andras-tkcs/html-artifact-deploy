@@ -9,6 +9,7 @@ path and query are never logged or put in an error message: a presigned URL's qu
 from __future__ import annotations
 
 import asyncio
+import http.client
 import ipaddress
 import logging
 import socket
@@ -140,11 +141,14 @@ class FetchClient:
                 raise too_big
             chunks: list[bytes] = []
             total = 0
-            while chunk := response.read(CHUNK):
-                total += len(chunk)
-                if total > limit:
-                    raise too_big
-                chunks.append(chunk)
+            try:
+                while chunk := response.read(CHUNK):
+                    total += len(chunk)
+                    if total > limit:
+                        raise too_big
+                    chunks.append(chunk)
+            except (OSError, http.client.HTTPException):
+                raise FetchClientError(f"Could not fetch the page from {host}.") from None
         finally:
             response.close()
         data = b"".join(chunks)

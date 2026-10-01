@@ -6,6 +6,7 @@ Type=oneshot
 User=html-artifact-deploy
 Group=html-artifact-deploy
 StateDirectory=html-artifact-deploy
+StateDirectoryMode=0700
 ReadWritePaths=/srv/pages
 NoNewPrivileges=yes
 ProtectSystem=strict

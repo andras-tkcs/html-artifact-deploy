@@ -68,6 +68,16 @@ class TestStateDB:
         StateDB(path).close()
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
+    def test_existing_folder_is_tightened_to_owner_only(self, tmp_path: Path) -> None:
+        folder = tmp_path / "state"
+        folder.mkdir(mode=0o755)
+        folder.chmod(0o755)
+        db = StateDB(folder / DB_FILE_NAME)
+        try:
+            assert stat.S_IMODE(folder.stat().st_mode) == 0o700
+        finally:
+            db.close()
+
     def test_transaction_rolls_back_on_an_exception(self, tmp_path: Path) -> None:
         db = StateDB(tmp_path / DB_FILE_NAME)
         with pytest.raises(RuntimeError), db.transaction() as connection:

@@ -16,7 +16,8 @@ All server state lives in one SQLite file, `<state.dir>/state.sqlite3`, opened t
 standard library in WAL mode with foreign keys on. The schema version is `PRAGMA user_version`; a
 file with an unknown version is refused at start-up rather than guessed at. Single-use rules are
 compare-and-set updates (`UPDATE ... WHERE used_at IS NULL`) inside transactions. The state folder
-is created with mode 0700.
+is created with mode 0700, and an existing folder is tightened to 0700 when the file is opened;
+the systemd units set `StateDirectoryMode=0700` as well.
 
 ## Alternatives considered
 
