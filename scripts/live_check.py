@@ -27,6 +27,7 @@ import argparse
 import json
 import sys
 import time
+import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,8 +46,34 @@ class LiveCheck:
     redact: Callable[[Any], Any]
 
 
-# name -> check. Empty until the server talks to an upstream service.
-CHECKS: dict[str, LiveCheck] = {}
+GOOGLE_OPENID_CONFIGURATION_URL = "https://accounts.google.com/.well-known/openid-configuration"
+GOOGLE_ENDPOINT_KEYS = (
+    "issuer",
+    "authorization_endpoint",
+    "token_endpoint",
+    "response_types_supported",
+    "scopes_supported",
+    "claims_supported",
+)
+
+
+def _fetch_google_openid_configuration() -> Any:
+    with urllib.request.urlopen(GOOGLE_OPENID_CONFIGURATION_URL, timeout=10) as response:  # nosec B310  # fixed https Google endpoint
+        return json.loads(response.read())
+
+
+def _keep_google_endpoints(data: Any) -> Any:
+    return {key: data[key] for key in GOOGLE_ENDPOINT_KEYS if key in data}
+
+
+# name -> check.
+CHECKS: dict[str, LiveCheck] = {
+    "google_openid_configuration": LiveCheck(
+        fixture="openid-configuration.json",
+        fetch=_fetch_google_openid_configuration,
+        redact=_keep_google_endpoints,
+    ),
+}
 
 
 def shape(value: Any) -> Any:
