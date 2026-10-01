@@ -37,12 +37,16 @@ BOB = "bob@example.com"
 HTML = "<!doctype html><title>Q3</title><p>héllo</p>"
 
 
+DAY = 86400
+
+
 class Env:
     def __init__(self, tmp_path: Path) -> None:
         self.root = tmp_path / "pages"
         self.root.mkdir()
-        config = PagesConfig(root=self.root, public_base_url=BASE)
-        index = PageIndex(StateDB(tmp_path / "state" / DB_FILE_NAME))
+        self.now = 1_700_000_000.0
+        config = PagesConfig(root=self.root, public_base_url=BASE, max_expiry_days=200, default_expiry_days=30)
+        index = PageIndex(StateDB(tmp_path / "state" / DB_FILE_NAME), clock=lambda: self.now)
         self.service = PageService(config, LocalFolderStore(self.root), index)
         self.uploads = UploadStore(StateDB(tmp_path / "state" / "up.sqlite3"), tmp_path / "uploads", BASE, 10_000)
         self.with_uploads = False
@@ -87,12 +91,32 @@ class TestToolList:
     async def test_lists_every_tool(self, env: Env) -> None:
         async with Client(env.server()) as client:
             names = {tool.name for tool in (await client.list_tools()).tools}
-        assert names == {"publish_page", "list_pages", "unpublish_page", "server_info"}
+        assert names == {"publish_page", "list_pages", "unpublish_page", "extend_page_expiry", "server_info"}
 
     async def test_every_tool_has_a_description(self, env: Env) -> None:
         async with Client(env.server()) as client:
             tools = (await client.list_tools()).tools
         assert all(tool.description and tool.description.strip() for tool in tools)
+
+    async def test_descriptions_carry_the_configured_limits(self, env: Env) -> None:
+        env.fetching({})
+        async with Client(env.server()) as client:
+            tools = {tool.name: tool.description or "" for tool in (await client.list_tools()).tools}
+        for name in ("publish_page", "publish_page_from_url", "extend_page_expiry"):
+            assert "200" in tools[name], name
+        for name in ("publish_page", "publish_page_from_url"):
+            assert "30 days for a new page" in tools[name], name
+            assert "Pages expire: an expired page is deleted" in tools[name], name
+        assert "Change when one of your HTML pages expires" in tools["extend_page_expiry"]
+
+    async def test_no_description_has_a_brace(self, env: Env) -> None:
+        env.with_uploads = True
+        env.fetching({})
+        async with Client(env.server()) as client:
+            tools = (await client.list_tools()).tools
+        assert len(tools) == 7
+        for tool in tools:
+            assert "{" not in (tool.description or "") and "}" not in (tool.description or ""), tool.name
 
     async def test_annotations(self, env: Env) -> None:
         async with Client(env.server()) as client:
@@ -107,6 +131,13 @@ class TestToolList:
         assert tools["list_pages"] == ToolAnnotations(
             title="List my HTML pages",
             readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        )
+        assert tools["extend_page_expiry"] == ToolAnnotations(
+            title="Change HTML page expiry",
+            readOnlyHint=False,
             destructiveHint=False,
             idempotentHint=True,
             openWorldHint=False,
@@ -373,3 +404,83 @@ class TestFreshInstances:
         """Tests must never share a server through module state; see server.py's docstring."""
         build: Callable[[], object] = env.server
         assert build() is not build()
+
+
+async def _publish(env: Env, **extra: object) -> dict[str, object]:
+    result = await _call(env, "publish_page", {"title": "One", "html": HTML, **extra})
+    assert not result.is_error, _text(result)
+    assert result.structured_content is not None
+    return result.structured_content
+
+
+class TestExpiry:
+    async def test_default_and_explicit_expiry(self, env: Env) -> None:
+        default = await _publish(env)
+        assert str(default["expires_at"]).startswith("2023-12-")  # 30 days after 2023-11-14
+        explicit = await _publish(env, expires_in_days=1)
+        assert explicit["expires_at"] != default["expires_at"]
+
+    async def test_bad_expires_in_days(self, env: Env) -> None:
+        result = await _call(env, "publish_page", {"title": "t", "html": HTML, "expires_in_days": 201})
+        assert result.is_error
+        assert "expires_in_days must be from 1 to 200, or 0 for the default of 30." in _text(result)
+
+    async def test_listed_with_expires_at(self, env: Env) -> None:
+        published = await _publish(env, expires_in_days=5)
+        (page,) = (await _call(env, "list_pages", {})).structured_content["pages"]  # type: ignore[index]
+        assert page["expires_at"] == published["expires_at"]
+
+    async def test_extend(self, env: Env) -> None:
+        published = await _publish(env)
+        result = await _call(env, "extend_page_expiry", {"page_id": published["page_id"], "days": 200})
+        assert not result.is_error
+        data = result.structured_content
+        assert data is not None
+        assert set(data) == {"page_id", "url", "expires_at"}
+        assert data["url"] == published["url"]
+        assert data["expires_at"] != published["expires_at"]
+
+    async def test_extend_beyond_the_limit_and_unknown_page(self, env: Env) -> None:
+        published = await _publish(env)
+        too_long = await _call(env, "extend_page_expiry", {"page_id": published["page_id"], "days": 201})
+        assert _text(too_long) == "Error executing tool extend_page_expiry: days must be from 1 to 200."
+        other = await _call(env, "extend_page_expiry", {"page_id": published["page_id"], "days": 5}, owner=BOB)
+        assert "No page with page_id" in _text(other)
+
+    async def test_expired_page_is_gone_then_purged_by_the_next_publish(self, env: Env) -> None:
+        published = await _publish(env, expires_in_days=1)
+        page_id = str(published["page_id"])
+        env.now += 2 * DAY
+        assert (await _call(env, "list_pages", {})).structured_content == {"pages": [], "count": 0}
+        extended = await _call(env, "extend_page_expiry", {"page_id": page_id, "days": 5})
+        assert "No page with page_id" in _text(extended)
+        unpublished = await _call(env, "unpublish_page", {"page_id": page_id})
+        assert "No page with page_id" not in _text(unpublished)  # get_any still finds it: take-down works
+        # an expired page whose owner did not take it down is purged by the next publish
+        second = await _publish(env, expires_in_days=1)
+        env.now += 2 * DAY
+        await _publish(env)
+        assert not (env.root / str(second["page_id"])).exists()
+
+    async def test_expired_page_cannot_be_unpublished_as_unknown_after_purge(self, env: Env) -> None:
+        published = await _publish(env, expires_in_days=1)
+        env.now += 2 * DAY
+        await _publish(env)  # purges it
+        result = await _call(env, "unpublish_page", {"page_id": published["page_id"]})
+        assert "No page with page_id" in _text(result)
+
+    async def test_from_url_accepts_expires_in_days(self, env: Env) -> None:
+        env.fetching({PAGE_URL: ok(HTML.encode())})
+        result = await _call(env, "publish_page_from_url", {"title": "Q3", "url": PAGE_URL, "expires_in_days": 200})
+        assert not result.is_error
+        bad = await _call(env, "publish_page_from_url", {"title": "Q3", "url": PAGE_URL, "expires_in_days": 201})
+        assert "expires_in_days must be from 1 to 200" in _text(bad)
+
+    async def test_upload_path_accepts_expires_in_days(self, env: Env) -> None:
+        env.with_uploads = True
+        upload_id = await env.upload(ALICE, HTML.encode())
+        ok_result = await _call(env, "publish_page", {"title": "t", "upload_id": upload_id, "expires_in_days": 7})
+        assert not ok_result.is_error
+        upload_id = await env.upload(ALICE, HTML.encode())
+        bad = await _call(env, "publish_page", {"title": "t", "upload_id": upload_id, "expires_in_days": 999})
+        assert "expires_in_days must be from 1 to 200" in _text(bad)

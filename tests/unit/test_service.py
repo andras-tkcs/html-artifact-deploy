@@ -371,3 +371,144 @@ class TestLogging:
         assert f"published page_id={page.record.page_id} owner={ALICE}" in text
         assert f"unpublished page_id={page.record.page_id} owner={ALICE}" in text
         assert "Secret Quarterly Title" not in text
+
+
+class TestExpiresInDays:
+    @pytest.mark.parametrize("days", [0, 1, 365])
+    async def test_new_page(self, service: PageService, clock: Clock, days: int) -> None:
+        page = await service.publish(ALICE, "t", HTML, expires_in_days=days)
+        assert page.record.expires_at == int(clock.now) + (days or 90) * DAY
+
+    @pytest.mark.parametrize("days", [366, -1])
+    async def test_out_of_range(self, service: PageService, days: int) -> None:
+        with pytest.raises(PageError) as error:
+            await service.publish(ALICE, "t", HTML, expires_in_days=days)
+        assert str(error.value) == "expires_in_days must be from 1 to 365, or 0 for the default of 90."
+        with pytest.raises(PageError, match="expires_in_days must be"):
+            await service.check_can_publish(ALICE, "t", "", days)
+
+    async def test_replacement_keeps_or_sets_the_expiry(self, service: PageService, clock: Clock) -> None:
+        page = await service.publish(ALICE, "t", HTML, expires_in_days=10)
+        clock.now += DAY
+        kept = await service.publish(ALICE, "t", HTML, page.record.page_id)
+        assert kept.record.expires_at == page.record.expires_at
+        moved = await service.publish(ALICE, "t", HTML, page.record.page_id, expires_in_days=3)
+        assert moved.record.expires_at == int(clock.now) + 3 * DAY
+
+
+class TestExtend:
+    async def test_extend_and_shorten(self, service: PageService, index: PageIndex, clock: Clock) -> None:
+        page = await service.publish(ALICE, "t", HTML)
+        longer = await service.extend(ALICE, page.record.page_id, 365)
+        assert longer.expires_at == int(clock.now) + 365 * DAY
+        shorter = await service.extend(ALICE, page.record.page_id, 1)
+        assert shorter.expires_at == int(clock.now) + DAY
+        assert index.get(ALICE, page.record.page_id) == shorter
+
+    @pytest.mark.parametrize("days", [0, 366])
+    async def test_days_out_of_range(self, service: PageService, days: int) -> None:
+        page = await service.publish(ALICE, "t", HTML)
+        with pytest.raises(PageError) as error:
+            await service.extend(ALICE, page.record.page_id, days)
+        assert str(error.value) == "days must be from 1 to 365."
+
+    async def test_other_owner(self, service: PageService) -> None:
+        page = await service.publish(ALICE, "t", HTML)
+        with pytest.raises(PageError) as error:
+            await service.extend(BOB, page.record.page_id, 5)
+        assert str(error.value) == no_such_page(page.record.page_id)
+
+    async def test_expired_page(self, service: PageService, clock: Clock) -> None:
+        page = await service.publish(ALICE, "t", HTML, expires_in_days=1)
+        clock.now += 2 * DAY
+        with pytest.raises(PageError, match="No page with page_id"):
+            await service.extend(ALICE, page.record.page_id, 5)
+
+    async def test_page_expiring_between_check_and_update(
+        self, service: PageService, index: PageIndex, clock: Clock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = await service.publish(ALICE, "t", HTML)
+        monkeypatch.setattr(index, "set_expiry", lambda owner, page_id, expires_at: False)
+        with pytest.raises(PageError, match="No page with page_id"):
+            await service.extend(ALICE, page.record.page_id, 5)
+
+
+class TestPurgeExpired:
+    async def test_deletes_expired_and_keeps_live(
+        self, service: PageService, index: PageIndex, clock: Clock, root: Path
+    ) -> None:
+        old = await service.publish(ALICE, "old", HTML, expires_in_days=1)
+        live = await service.publish(ALICE, "live", HTML, expires_in_days=10)
+        clock.now += 2 * DAY
+        assert await service.purge_expired() == 1
+        assert not (root / old.record.page_id).exists()
+        assert index.get_any(ALICE, old.record.page_id) is None
+        assert (root / live.record.page_id / "index.html").exists()
+        assert index.get(ALICE, live.record.page_id) is not None
+
+    async def test_storage_error_keeps_the_row_requeues_and_logs(
+        self,
+        fake_service: PageService,
+        fake_store: FakeStore,
+        index: PageIndex,
+        clock: Clock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        first = await fake_service.publish(ALICE, "a", HTML, expires_in_days=1)
+        clock.now += 10
+        second = await fake_service.publish(ALICE, "b", HTML, expires_in_days=1)
+        clock.now += 2 * DAY
+        fake_store.delete_error = StorageError("busy")
+        with caplog.at_level(logging.WARNING, logger="html_artifact_deploy.service"):
+            assert await fake_service.purge_expired() == 0
+        assert f"could not delete expired page_id={first.record.page_id}: busy" in caplog.text
+        assert index.get_any(ALICE, first.record.page_id) is not None
+        order = [record.page_id for record in index.expired(10)]
+        assert set(order) == {first.record.page_id, second.record.page_id}
+        fake_store.delete_error = None
+        assert await fake_service.purge_expired() == 2
+
+    async def test_failing_row_goes_behind_the_others(
+        self, fake_service: PageService, fake_store: FakeStore, index: PageIndex, clock: Clock
+    ) -> None:
+        first = await fake_service.publish(ALICE, "a", HTML, expires_in_days=1)
+        clock.now += 10
+        second = await fake_service.publish(ALICE, "b", HTML, expires_in_days=1)
+        clock.now += 2 * DAY
+        original = fake_store.delete_page
+
+        def failing_for_first(page_id: str) -> bool:
+            if page_id == first.record.page_id:
+                raise StorageError("busy")
+            return original(page_id)
+
+        fake_store.delete_page = failing_for_first  # type: ignore[method-assign]
+        assert await fake_service.purge_expired(limit=1) == 0
+        assert [r.page_id for r in index.expired(1)] == [second.record.page_id]
+
+    async def test_concurrently_removed_page_is_not_counted(
+        self, service: PageService, index: PageIndex, clock: Clock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        await service.publish(ALICE, "a", HTML, expires_in_days=1)
+        clock.now += 2 * DAY
+        monkeypatch.setattr(index, "remove_expired", lambda page_id: False)
+        assert await service.purge_expired() == 0
+
+    async def test_limit_is_honoured(self, service: PageService, clock: Clock) -> None:
+        for _ in range(3):
+            await service.publish(ALICE, "a", HTML, expires_in_days=1)
+        clock.now += 2 * DAY
+        assert await service.purge_expired(limit=2) == 2
+        assert await service.purge_expired(limit=2) == 1
+
+    async def test_purge_failure_inside_publish_is_logged_not_raised(
+        self, service: PageService, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def boom(limit: int = 50) -> int:
+            raise RuntimeError("disk on fire")
+
+        monkeypatch.setattr(service, "purge_expired", boom)
+        with caplog.at_level(logging.WARNING, logger="html_artifact_deploy.service"):
+            page = await service.publish(ALICE, "t", HTML)
+        assert page.created
+        assert "expired-page purge failed" in caplog.text

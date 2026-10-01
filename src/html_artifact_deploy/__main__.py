@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import sys
 from collections.abc import Mapping
@@ -32,6 +33,7 @@ from .token_store import TokenStore
 
 DEFAULT_TOKEN_DAYS = 365
 MAX_TOKEN_DAYS = 3650
+PURGE_CLI_BATCH = 10_000
 
 
 def _run_uvicorn(app: Starlette, http: HttpConfig) -> None:  # pragma: no cover
@@ -56,6 +58,7 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
     commands.add_parser("serve-http", help="serve the tools over Streamable HTTP with Google sign-in")
     commands.add_parser("check-config", help="validate the configuration file and the folders it names")
+    commands.add_parser("purge-expired", help="delete expired pages now")
     token = commands.add_parser("token", help="manage API tokens")
     actions = token.add_subparsers(dest="action", metavar="ACTION", required=True)
     create = actions.add_parser("create", help="create an API token")
@@ -111,6 +114,20 @@ def _check_config(config: Config, env: Mapping[str, str]) -> int:
     return 0
 
 
+def _purge_expired(config: Config) -> int:
+    store = LocalFolderStore(config.pages.root)
+    store.check()
+    service = PageService(config.pages, store, PageIndex(StateDB(config.state_dir / DB_FILE_NAME)))
+    deleted = 0
+    while True:
+        count = asyncio.run(service.purge_expired(limit=PURGE_CLI_BATCH))
+        deleted += count
+        if count < PURGE_CLI_BATCH:
+            break
+    print(f"Deleted {deleted} expired pages.")
+    return 0
+
+
 def _token(config: Config, args: argparse.Namespace) -> int:
     _, auth = require_http(config)
     tokens = TokenStore(StateDB(config.state_dir / DB_FILE_NAME))
@@ -145,6 +162,8 @@ def main(argv: list[str] | None = None, environ: Mapping[str, str] | None = None
             return _serve_http(config, env)
         if args.command == "check-config":
             return _check_config(config, env)
+        if args.command == "purge-expired":
+            return _purge_expired(config)
         if args.command == "token":
             return _token(config, args)
         return _stdio(config)
