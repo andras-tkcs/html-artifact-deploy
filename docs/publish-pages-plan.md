@@ -7,7 +7,9 @@ turns the template skeleton into a complete MCP server that publishes such a pag
 server the organization runs and answers with the page's link. Anyone with the link can open the
 page. The person who published a page can replace it at the same link, list their pages and take
 one down. People sign in with their Google Workspace account. claude.ai and Claude Desktop connect
-through OAuth; Claude Code connects through OAuth or a personal API token. Large pages go through
+through OAuth; Claude Code connects through OAuth or a personal API token. A page's link is only a
+random 128-bit id, never a file name. Every page expires (90 days by default, at most 365), and
+its owner can extend it, so forgotten pages do not fill the disk. Large pages go through
 a one-time upload URL instead of a tool argument, or, when the page is already online on a host
 the administrator allows, the server downloads it from its https address.
 
@@ -80,11 +82,11 @@ One Python package, one process per deployment, two transports built from one fa
 | Module (`src/html_artifact_deploy/`) | Holds |
 |---|---|
 | `config.py` | The TOML configuration file: `Config` and its sections, `load_config`, `ConfigError` (D2) |
-| `pages.py` | Page ids, slugs, titles, links (D3) |
+| `pages.py` | Page ids, titles, links (D3) |
 | `storage.py` | `PageStore` protocol, `LocalFolderStore`, `StorageError` (D4) |
 | `state.py` | `StateDB`: the one SQLite file and its schema (D5) |
 | `page_index.py` | `PageIndex`, `PageRecord`: who published which page (D6) |
-| `service.py` | `PageService`: publish, list, unpublish; `PageError` (D7) |
+| `service.py` | `PageService`: publish, list, unpublish, extend, purge expired pages; `PageError` (D7, D17) |
 | `server.py` | `AppContext`, `build_server()`: the MCP tools (D8) |
 | `google_oidc_client.py` | `GoogleOidcClient`, `GoogleIdentity`, `GoogleOidcClientError` (D9) |
 | `token_store.py` | `TokenStore`: OAuth clients, pending sign-ins, codes, tokens, API tokens (D10) |
@@ -107,7 +109,7 @@ Coverage floors at 100 (`MODULE_FLOORS` in `scripts/check_coverage_floor.py`, wi
 comment each) are added in the same phases for `config.py`, `storage.py` (p3), `token_store.py`,
 `oauth_provider.py`, `http_app.py` (p6), `uploads.py` (p7) and `fetch_client.py` (p8).
 
-`CHANGELOG.md` is written only by p10; no other phase edits it.
+`CHANGELOG.md` is written only by p11; no other phase edits it.
 
 Blocking work (SQLite, file I/O, the Google HTTP call) is synchronous inside its module and called
 from `async def` code through `asyncio.to_thread(...)` (coding guidelines, "Async and
@@ -127,6 +129,8 @@ A TOML file read with `tomllib`. Path: the `--config PATH` option, else the envi
 root = "/srv/pages"                            # required
 public_base_url = "https://pages.example.com"  # required
 max_bytes = 16000000                           # optional
+default_expiry_days = 90                       # optional
+max_expiry_days = 365                          # optional
 
 [state]
 dir = "/var/lib/html-artifact-deploy"          # required
@@ -164,6 +168,8 @@ class PagesConfig:
     root: Path
     public_base_url: str        # no trailing slash
     max_bytes: int = DEFAULT_MAX_BYTES
+    default_expiry_days: int = DEFAULT_EXPIRY_DAYS
+    max_expiry_days: int = MAX_EXPIRY_DAYS
 
 @dataclass(frozen=True)
 class HttpConfig:
@@ -196,6 +202,8 @@ class FetchConfig:                                       # added by p8
 
 DEFAULT_MAX_BYTES = 16_000_000      # the size limit of a claude.ai artifact
 MAX_MAX_BYTES = 50_000_000
+DEFAULT_EXPIRY_DAYS = 90            # about three months
+MAX_EXPIRY_DAYS = 365               # twelve months; also the ceiling an administrator can set
 DEFAULT_SECRET_ENV = "HTML_ARTIFACT_DEPLOY_GOOGLE_CLIENT_SECRET"  # nosec B105  # a variable name, not a secret
 DEFAULT_REDIRECT_URI_ALLOWLIST = ("https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback")
 
@@ -221,6 +229,8 @@ trailing `/` is stripped. Allowed-email and domain values are lowercased on load
 | `pages.root` not a non-empty string naming an absolute path | `pages.root must be the absolute path of the folder the web server publishes, for example /srv/pages` |
 | `pages.public_base_url` not `<https URL>` | `pages.public_base_url must be the https:// address at which the web server publishes pages.root, for example https://pages.example.com` |
 | `pages.max_bytes` present and not an `int` (not `bool`) in 1…50 000 000 | `pages.max_bytes must be a whole number of bytes from 1 to 50000000` |
+| `pages.max_expiry_days` present and not an `int` (not `bool`) in 1…365 | `pages.max_expiry_days must be a whole number of days from 1 to 365` |
+| `pages.default_expiry_days` present and not an `int` (not `bool`) in 1…`max_expiry_days` (after that key's default) | `pages.default_expiry_days must be a whole number of days from 1 to pages.max_expiry_days ({max_expiry_days})` |
 | `state.dir` missing or not an absolute path | `state.dir must be the absolute path of a folder this server keeps its database in, for example /var/lib/html-artifact-deploy` |
 | `stdio.user` present and not a non-empty string of at most 200 characters | `stdio.user must be a non-empty name, at most 200 characters` |
 | `http.public_url` missing or not `<https URL>` | `http.public_url must be the https:// address of this server, for example https://publish.example.com` |
@@ -263,34 +273,40 @@ sets `hd` only for accounts managed by that Workspace, and to the primary domain
 a secondary domain, so `hd` alone decides; the e-mail's own domain is not compared. For API tokens
 (D13), which have no Google `hd` claim, the caller passes `hosted_domain = email.rpartition("@")[2]`.
 
-### D3. Ids, slugs, links: `pages.py`
+### D3. Ids and links: `pages.py`
+
+A page's public address is only a random id: `https://pages.example.com/<page_id>/`. No file
+name, title or other readable part appears in it, so two pages can never collide on a name and
+an address cannot be guessed from what the page is about.
 
 ```python
-PAGE_ID_RE = re.compile(r"^[a-z2-7]{24}$")
-SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,59}$")
+PAGE_ID_RE = re.compile(r"[0-9a-f]{32}")      # used only as PAGE_ID_RE.fullmatch(value)
+PAGE_FILE_NAME = "index.html"
 MAX_TITLE = 200
 
-def new_page_id() -> str          # base64.b32encode(secrets.token_bytes(15)).decode("ascii").lower(): 24 chars, 120 bits
-def slugify(title: str) -> str
+def new_page_id() -> str          # secrets.token_hex(16): 32 lowercase hex characters, 128 random bits
 def is_page_id(value: str) -> bool
-def page_url(public_base_url: str, page_id: str, slug: str) -> str   # f"{public_base_url}/{page_id}/{slug}.html"
+def page_url(public_base_url: str, page_id: str) -> str   # f"{public_base_url}/{page_id}/"
 def clean_title(title: str) -> str   # strip; raises ValueError("title must be 1 to 200 characters.") if the result is 0 or >200 chars
 ```
 
-`slugify`: `unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode("ascii").lower()`;
-replace each run of characters outside `[a-z0-9]` with `-`; strip `-` from both ends; cut to 60
-characters; strip `-` again; `"page"` if empty. `slugify("Q3 report: Ünits & Co.") ==
-"q3-report-units-co"`. `page_url` raises `ValueError` unless `is_page_id(page_id)` and
-`SLUG_RE.match(slug)`.
+`page_url` raises `ValueError` unless `is_page_id(page_id)`. The title is kept only in the index
+(D6), for `list_pages`; it is never part of the address or the file name.
+
+Uniqueness: 128 random bits make a collision practically impossible, and it is still refused
+rather than assumed away: a new page's folder is created with an exclusive `mkdir` (D4), and a
+new page's row is a plain `INSERT` against the `page_id` primary key (D5, D6). On either clash `PageService.publish` draws a new id, at
+most `NEW_ID_ATTEMPTS = 3` times (D7).
 
 ### D4. Storage: `storage.py`
 
 ```python
 class StorageError(Exception): ...
+class PageExistsError(StorageError): ...                          # a new page's folder already exists
 
 class PageStore(Protocol):
     def check(self) -> None: ...                                  # raises StorageError if unusable
-    def write_page(self, page_id: str, slug: str, data: bytes) -> None: ...
+    def write_page(self, page_id: str, data: bytes, *, new: bool) -> None: ...
     def delete_page(self, page_id: str) -> bool: ...              # False if there was nothing to delete
 
 class LocalFolderStore:
@@ -300,20 +316,25 @@ class LocalFolderStore:
 The protocol is the seam for a later remote backend (for example SFTP); nothing outside
 `storage.py`, `__main__.py` and `http_app.py` names `LocalFolderStore`.
 
-`LocalFolderStore`:
+`LocalFolderStore` (a page is `<root>/<page_id>/index.html`; the web server serves
+`/<page_id>/` from it):
 - `check()`: `root.is_dir()` and `os.access(root, os.W_OK)`, else
   `StorageError(f"The pages folder {root} does not exist or this server cannot write to it.")`.
-- `write_page`: `ValueError` unless `pages.is_page_id(page_id)` and `pages.SLUG_RE` matches
-  `slug`. `folder = root / page_id`; `StorageError("The pages folder contains a link where a page folder should be.")`
-  if `folder.is_symlink()`; `folder.mkdir(mode=0o755, exist_ok=True)`; `os.chmod(folder, 0o755)`;
-  `fd, tmp = tempfile.mkstemp(dir=folder, prefix=f".{slug}.", suffix=".tmp")`; write all bytes;
-  `os.fsync`; close; `os.chmod(tmp, 0o644)`; `os.replace(tmp, folder / f"{slug}.html")`. On any
+- `write_page`: `ValueError` unless `pages.is_page_id(page_id)`. `folder = root / page_id`.
+  With `new=True`: `folder.mkdir(mode=0o755)` (no `exist_ok`); `FileExistsError` →
+  `PageExistsError("A page folder with that id already exists.")`. With `new=False`:
+  `StorageError("The pages folder contains a link where a page folder should be.")` if
+  `folder.is_symlink()`, and `StorageError("The page's folder is missing from the pages folder.")`
+  if `not folder.is_dir()`. Then `os.chmod(folder, 0o755)`;
+  `fd, tmp = tempfile.mkstemp(dir=folder, prefix=".index.", suffix=".tmp")`; write all bytes;
+  `os.fsync`; close; `os.chmod(tmp, 0o644)`; `os.replace(tmp, folder / PAGE_FILE_NAME)`. On any
   `OSError` after `mkstemp`, try once to `os.unlink(tmp)` (ignoring `OSError`), then raise.
 - `delete_page`: `ValueError` unless `is_page_id`; `False` if `not folder.exists()`;
   `StorageError` as above if it is a symlink; `shutil.rmtree(folder)`; `True`.
-- Every `OSError` is logged with `logger.warning("Pages folder %s failed for %s: %s", operation,
-  page_id, exc.strerror)` and re-raised as `StorageError("The page could not be saved in the pages folder.")`
-  (write) or `StorageError("The page could not be removed from the pages folder.")` (delete).
+- Every other `OSError` is logged with `logger.warning("Pages folder %s failed for %s: %s",
+  operation, page_id, exc.strerror)` and re-raised as
+  `StorageError("The page could not be saved in the pages folder.")` (write) or
+  `StorageError("The page could not be removed from the pages folder.")` (delete).
 
 ### D5. State database: `state.py`
 
@@ -347,9 +368,11 @@ Schema version 1 (every table any later phase needs, so no later phase migrates)
 
 ```sql
 CREATE TABLE pages (
-  page_id TEXT PRIMARY KEY, owner TEXT NOT NULL, title TEXT NOT NULL, slug TEXT NOT NULL,
-  bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+  page_id TEXT PRIMARY KEY, owner TEXT NOT NULL, title TEXT NOT NULL,
+  bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL);
 CREATE INDEX pages_by_owner ON pages(owner, updated_at);
+CREATE INDEX pages_by_expiry ON pages(expires_at);
 CREATE TABLE oauth_clients (client_id TEXT PRIMARY KEY, info_json TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE auth_requests (
   state_hash TEXT PRIMARY KEY, client_id TEXT NOT NULL, params_json TEXT NOT NULL,
@@ -372,7 +395,7 @@ CREATE INDEX uploads_by_owner ON uploads(owner, state);
 Secrets (tokens, codes, `state` values, upload ids) are stored only as
 `hashlib.sha256(value.encode()).hexdigest()`; `state.py` exports `def secret_hash(value: str) -> str`.
 
-### D6. Ownership: `page_index.py`
+### D6. Ownership and expiry: `page_index.py`
 
 ```python
 @dataclass(frozen=True)
@@ -380,24 +403,39 @@ class PageRecord:
     page_id: str
     owner: str
     title: str
-    slug: str
     bytes: int
     sha256: str
     created_at: int
     updated_at: int
+    expires_at: int
+
+class PageIdTakenError(Exception): ...                                    # insert() of an existing page_id
 
 class PageIndex:
-    def __init__(self, db: StateDB) -> None: ...
-    def get(self, owner: str, page_id: str) -> PageRecord | None: ...    # None if absent OR owned by someone else
-    def list(self, owner: str, limit: int) -> list[PageRecord]: ...       # newest updated_at first, then page_id
-    def upsert(self, record: PageRecord) -> None: ...
-    def remove(self, owner: str, page_id: str) -> bool: ...
+    clock: Callable[[], float]                                            # the one clock for page times; PageService reads it
+    def __init__(self, db: StateDB, *, clock: Callable[[], float] = time.time) -> None: ...
+    def get(self, owner: str, page_id: str) -> PageRecord | None: ...    # None if absent, owned by someone else, or expired
+    def get_any(self, owner: str, page_id: str) -> PageRecord | None: ... # as get, but also returns an expired row
+    def exists(self, page_id: str) -> bool: ...                           # any owner, expired or not
+    def list(self, owner: str, limit: int) -> list[PageRecord]: ...       # unexpired only; newest updated_at first, then page_id
+    def insert(self, record: PageRecord) -> None: ...                     # plain INSERT; sqlite3.IntegrityError -> PageIdTakenError
+    def update_live(self, record: PageRecord) -> bool: ...                # UPDATE title, bytes, sha256, updated_at, expires_at
+                                                                          #   WHERE page_id = ? AND owner = ? AND expires_at > now
+    def set_expiry(self, owner: str, page_id: str, expires_at: int) -> bool: ...   # only an unexpired row of that owner
+    def remove(self, owner: str, page_id: str) -> bool: ...               # any expiry state
+    def expired(self, limit: int) -> list[PageRecord]: ...                # any owner, expires_at <= now, oldest first
+    def remove_expired(self, page_id: str) -> bool: ...                  # DELETE … WHERE page_id = ? AND expires_at <= now
+    def requeue_expired(self, page_id: str) -> None: ...                 # UPDATE SET expires_at = now WHERE page_id = ? AND expires_at <= now
 ```
 
-The index is what makes a page "yours": listing reads only it, and replacing or unpublishing
-refuses a `page_id` whose row has another owner. The pages folder is shared by everyone and is
-never listed. `owner` is the lowercased Google e-mail address over HTTP, or `stdio.user` over
-stdio.
+The index is what makes a page "yours": listing reads only it, and replacing, extending or
+unpublishing refuses a `page_id` whose row has another owner. The pages folder is shared by
+everyone and is never listed. `owner` is the lowercased Google e-mail address over HTTP, or
+`stdio.user` over stdio. An expired page is treated as gone by every per-owner method, even in
+the minutes before the purge (D17) deletes its files; the exceptions are `get_any`, which lets an
+owner take down an expired page whose files are still served, and the purge methods. No method
+makes an expired row live again (`update_live` and `set_expiry` refuse expired rows), so once a
+row has expired the purge can delete its folder without racing a replacement.
 
 ### D7. Business logic: `service.py`
 
@@ -411,32 +449,50 @@ class PublishResult:
     created: bool
 
 class PageService:
-    def __init__(self, config: PagesConfig, store: PageStore, index: PageIndex, *, clock: Callable[[], float] = time.time) -> None: ...
+    def __init__(self, config: PagesConfig, store: PageStore, index: PageIndex) -> None: ...   # "now" is int(index.clock())
     def url_for(self, record: PageRecord) -> str: ...
-    async def publish(self, owner: str, title: str, data: bytes, page_id: str = "") -> PublishResult: ...
+    async def publish(self, owner: str, title: str, data: bytes, page_id: str = "", expires_in_days: int = 0) -> PublishResult: ...
     async def list_pages(self, owner: str, limit: int) -> list[PageRecord]: ...
     async def unpublish(self, owner: str, page_id: str) -> PageRecord: ...
-    async def check_can_publish(self, owner: str, title: str, page_id: str) -> None: ...
+    async def check_can_publish(self, owner: str, title: str, page_id: str, expires_in_days: int = 0) -> None: ...
+    # from p9 (D17): extend, purge_expired
 ```
 
-`publish`, in this order:
+`publish(owner, title, data, page_id="", expires_in_days=0)`, in this order:
 1. `title = pages.clean_title(title)`; its `ValueError` → `PageError("title must be 1 to 200 characters.")`.
-2. `len(data) == 0` → `PageError("The page is empty.")`.
-3. `len(data) > config.max_bytes` → `PageError(f"The page is {len(data):,} bytes, over the {config.max_bytes:,}-byte limit.")`.
-4. `data.decode("utf-8")` fails → `PageError("The page is not UTF-8 text, so it is not an HTML page.")`.
-5. If `page_id`: `existing = index.get(owner, page_id)`; `None` →
-   `PageError(f"No page with page_id {page_id!r} was published by you. Call list_pages to see your pages.")`.
-   The slug and `created_at` of `existing` are kept; the title is updated.
-   Else: `page_id = new_page_id()`, `slug = slugify(title)`.
-6. `await asyncio.to_thread(store.write_page, page_id, slug, data)`; `StorageError` →
+2. `expires_in_days` not `0` and not in `1…config.max_expiry_days` →
+   `PageError(f"expires_in_days must be from 1 to {config.max_expiry_days}, or 0 for the default of {config.default_expiry_days}.")`.
+3. `len(data) == 0` → `PageError("The page is empty.")`.
+4. `len(data) > config.max_bytes` → `PageError(f"The page is {len(data):,} bytes, over the {config.max_bytes:,}-byte limit.")`.
+5. `data.decode("utf-8")` fails → `PageError("The page is not UTF-8 text, so it is not an HTML page.")`.
+6. If `page_id`: `existing = index.get(owner, page_id)`; `None` →
+   `PageError(f"No page with page_id {page_id!r} was published by you, or it has expired. Call list_pages to see your pages.")`.
+   `created_at` is kept; the title is updated; `expires_at` is kept when `expires_in_days == 0`,
+   else set to `now + expires_in_days * 86400`. `store.write_page(page_id, data, new=False)`.
+   Else: `expires_at = now + (expires_in_days or config.default_expiry_days) * 86400`; up to
+   `NEW_ID_ATTEMPTS` times draw `page_id = new_page_id()` (call it as the module-level name
+   `new_page_id` imported into `service.py`, which tests monkeypatch), skip it if
+   `index.exists(page_id)`, and call `store.write_page(page_id, data, new=True)`, drawing again on
+   `PageExistsError`; if every attempt clashes → `PageError("Could not allocate a new page id. Try again.")`.
+   Store and index calls go through `asyncio.to_thread`.
+7. Any other `StorageError` →
    `PageError("The page could not be saved on the server. Try again later, or ask whoever runs html-artifact-deploy to check its log.")`.
-7. `index.upsert(...)` (through `to_thread`) with `sha256 = hashlib.sha256(data).hexdigest()`.
-8. `logger.info("published page_id=%s owner=%s bytes=%d replaced=%s", ...)`. Never the content or title.
+8. Record the page (`sha256 = hashlib.sha256(data).hexdigest()`): a new page with
+   `index.insert(...)` (a `PageIdTakenError`, possible only in a race between two publishes, →
+   delete the folder just written and `PageError("Could not allocate a new page id. Try again.")`);
+   a replacement with `index.update_live(...)`, where `False` (the page expired or was taken down
+   meanwhile) → the step-6 "No page with page_id …" error.
+9. `logger.info("published page_id=%s owner=%s bytes=%d replaced=%s", ...)`. Never the content or title.
 
-`check_can_publish` runs steps 1 and 5's ownership check only; the upload path (D12) calls it
+p3 implements `publish` without the `expires_in_days` parameter (always the default for a new
+page, kept on a replacement) and without step 2; p9 adds both (D17).
+
+`check_can_publish(owner, title, page_id, expires_in_days=0)` runs steps 1, 2 (from p9) and 6's
+ownership check only; the upload path (D12) calls it
 before reading an upload, so a bad title does not consume the upload.
 
-`unpublish`: `index.get` → `None` gives the same "No page with page_id …" error; then
+`unpublish`: `index.get_any` (so an expired page whose files are still served can be taken down
+at once) → `None` gives the same "No page with page_id …" error; then
 `store.delete_page` (a `StorageError` →
 `PageError("The page could not be removed from the server. Try again later, or ask whoever runs html-artifact-deploy to check its log.")`
 and the index is left unchanged); then `index.remove`; log
@@ -480,13 +536,14 @@ annotations `ToolAnnotations(title="Publish HTML page", readOnlyHint=False, dest
 > Pass the whole HTML document as html, with CSS and scripts inline or loaded from public CDNs.
 > For a page over about 100 KB, when create_page_upload is available, upload the file first and
 > pass upload_id instead. Returns page_id, url, title, bytes, created (false when an existing page
-> was replaced) and updated_at. Give url to the user: anyone with that link can open the page. To
-> change a page you published, call this again with its page_id; the page is replaced and keeps its
-> url. Use list_pages to find a page_id, and unpublish_page to take a page down.
+> was replaced), updated_at and expires_at. Give url to the user: anyone with that link can open
+> the page until it expires. To change a page you published, call this again with its page_id;
+> the page is replaced and keeps its url. Use list_pages to find a page_id, and unpublish_page to
+> take a page down.
 >
 > Args:
->     title: What the page is, in words, for example "Q3 report". 1 to 200 characters. It also
->         names the file in the link (q3-report.html); a replacement keeps the original link.
+>     title: What the page is, in words, for example "Q3 report". 1 to 200 characters. It is
+>         shown in list_pages only; the link is a random id and never contains it.
 >     html: The complete HTML document. Give exactly one of html and upload_id.
 >     upload_id: The upload_id from create_page_upload, after the file was PUT to its upload_url.
 >         Empty when html is given.
@@ -496,21 +553,22 @@ Flow: exactly one of `html`/`upload_id` non-empty, else `ToolError("Give exactly
 With `upload_id` and `app.uploads is None`: `ToolError("Uploads are not available on this connection; pass the page as html.")`.
 With `html`: `service.publish(owner, title, html.encode("utf-8"), page_id)`.
 With `upload_id` (p7): `await service.check_can_publish(owner, title, page_id)`, then
-`data = await uploads.read(owner, upload_id)`, then `service.publish(...)`, then
+`data = await uploads.read(owner, upload_id)`, then `service.publish(owner, title, data, page_id)`, then
 `await uploads.discard(upload_id)`.
-Result: `{"page_id", "url", "title", "bytes", "created", "updated_at"}` (ISO string).
+Result: `{"page_id", "url", "title", "bytes", "created", "updated_at", "expires_at"}` (timestamps as ISO strings).
 
 p8 inserts one sentence after "pass upload_id instead.": `If the page is already online,
-publish_page_from_url (when available) fetches it from its address instead.`
+publish_page_from_url (when available) fetches it from its address instead.` p9 adds the
+`expires_in_days` parameter and its sentences (D17).
 
 **`list_pages(limit: int = 50) -> dict[str, object]`**
 annotations `ToolAnnotations(title="List my HTML pages", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)`
 
 > List the HTML pages you published, newest first.
 >
-> Returns pages (each with page_id, title, url, bytes, created_at and updated_at) and count. Only
-> your own pages are listed. Use a page_id with publish_page to replace that page, or with
-> unpublish_page to take it down.
+> Returns pages (each with page_id, title, url, bytes, created_at, updated_at and expires_at) and
+> count. Only your own pages that have not expired are listed. Use a page_id with publish_page to
+> replace that page, or with unpublish_page to take it down.
 >
 > Args:
 >     limit: The most pages to return, 1 to 200. Defaults to 50.
@@ -827,6 +885,7 @@ html-artifact-deploy [--config PATH] check-config           validate the file an
 html-artifact-deploy [--config PATH] token create --user EMAIL --name NAME [--days N]
 html-artifact-deploy [--config PATH] token list
 html-artifact-deploy [--config PATH] token revoke --user EMAIL --name NAME
+html-artifact-deploy [--config PATH] purge-expired          delete expired pages now (added by p9, D17)
 ```
 
 - `--config` is a top-level option (before the subcommand). `main(argv=None, environ=None) -> int`
@@ -863,6 +922,12 @@ Files under `deploy/`:
   `ReadWritePaths=/srv/pages`, `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`,
   `PrivateTmp=yes`, `PrivateDevices=yes`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`,
   `Restart=on-failure`, `UMask=0022`.
+- `deploy/html-artifact-deploy-purge.service` — `Type=oneshot`, the same `User`, `Group`,
+  `StateDirectory`, `ReadWritePaths` and hardening lines as the main unit, no `EnvironmentFile`,
+  `ExecStart=/opt/html-artifact-deploy/bin/html-artifact-deploy --config /etc/html-artifact-deploy/config.toml purge-expired`.
+- `deploy/html-artifact-deploy-purge.timer` — `OnCalendar=hourly`, `RandomizedDelaySec=300`,
+  `Persistent=true`, `[Install] WantedBy=timers.target`. The service also purges on every publish
+  (D17); the timer covers quiet periods.
 - `deploy/Caddyfile.example`:
 
 ```
@@ -883,10 +948,11 @@ pages.example.com {
 }
 ```
 
-`file_server` without `browse` lists no directories, so the random folder name keeps other
+`file_server` serves `/<page_id>/` from the folder's `index.html` and redirects `/<page_id>` to
+it; without `browse` it lists no directories, so the random folder name keeps other
 pages from being found.
 
-`docs/deployment.md` (p9), in order: 1. DNS; 2. Google OAuth client (Google Auth Platform: Branding, then Audience
+`docs/deployment.md` (p10), in order: 1. DNS; 2. Google OAuth client (Google Auth Platform: Branding, then Audience
 set to **Internal**, then Clients → Create client → **Web application**, authorized redirect URI `https://publish.example.com/oauth/google/callback`);
 3. `sudo apt install caddy` (Caddy's apt repository), `sudo useradd --system --home-dir /var/lib/html-artifact-deploy --shell /usr/sbin/nologin html-artifact-deploy`,
 `sudo install -d -o html-artifact-deploy -g html-artifact-deploy -m 755 /srv/pages`;
@@ -902,10 +968,10 @@ It notes: the sandbox header gives every page an opaque origin, so `localStorage
 don't persist, and claude.ai-only artifact features (shared storage, asking Claude) do not work
 once a page is published elsewhere.
 
-`docs/configuration.md` (p9): every key of D2 with its type, default and meaning, and the D13
+`docs/configuration.md` (p10): every key of D2 with its type, default and meaning, and the D13
 commands.
 
-### D15. Connecting clients (README, p9)
+### D15. Connecting clients (README, p10)
 
 - **claude.ai and Claude Desktop**: Settings → Connectors → Add custom connector, URL
   `https://publish.example.com/mcp`; sign in with Google when asked.
@@ -1003,15 +1069,17 @@ annotations `ToolAnnotations(title="Publish HTML page from URL", readOnlyHint=Fa
 > The server downloads the file itself, so the page does not have to pass through this
 > conversation; use it for large pages. The address must be on a host this server allows (an error
 > names them) and must return the file to a plain GET with no sign-in, for example a raw file on a
-> Git host or a presigned storage link. Returns page_id, url, title, bytes, created and updated_at,
-> as publish_page does. To change a page you published, pass its page_id; the page is replaced and
+> Git host or a presigned storage link. Returns page_id, url, title, bytes, created, updated_at
+> and expires_at, as publish_page does. To change a page you published, pass its page_id; the page is replaced and
 > keeps its url. For a page you have as text, use publish_page.
 >
 > Args:
->     title: What the page is, in words, for example "Q3 report". 1 to 200 characters. It also
->         names the file in the link; a replacement keeps the original link.
+>     title: What the page is, in words, for example "Q3 report". 1 to 200 characters. It is
+>         shown in list_pages only; the link is a random id and never contains it.
 >     url: The https address of the HTML file.
 >     page_id: The page_id of a page you published, to replace it. Empty to publish a new page.
+
+p9 later adds `expires_in_days` to this tool exactly as to `publish_page` (D17).
 
 Flow: `await service.check_can_publish(owner, title, page_id)` (so a bad title or a foreign page_id
 costs no download), `data = await fetcher.fetch(url)`, `service.publish(owner, title, data, page_id)`
@@ -1022,6 +1090,79 @@ costs no download), `data = await fetcher.fetch(url)`, `service.publish(owner, t
 when `config.fetch` is set and pass it as `AppContext.fetcher`. The limits are therefore the same
 on every path: `pages.max_bytes` (16 MB by default) for the page, `fetch.timeout_seconds` per
 network operation.
+
+### D17. Expiry (p9): `service.py`, `server.py`, `__main__.py`
+
+Every page expires, so forgotten pages do not fill the disk. A new page lives
+`pages.default_expiry_days` (90, about three months) unless the caller asks for 1 to
+`pages.max_expiry_days` (365) days. The owner can move the expiry at any time to between 1 and
+`max_expiry_days` days from now. Once a page expires its owner no longer sees it, and within about
+an hour (the next publish or the hourly timer) its folder is deleted and its link answers 404.
+
+Service additions (`PageService`):
+
+```python
+PURGE_BATCH = 50
+PURGE_CLI_BATCH = 10_000           # in __main__.py; tests monkeypatch it to 1
+
+async def extend(self, owner: str, page_id: str, days: int) -> PageRecord: ...
+async def purge_expired(self, limit: int = PURGE_BATCH) -> int: ...      # number of pages deleted
+```
+
+- `publish` gains `expires_in_days: int = 0` and step 2 (D7); `check_can_publish` gains the same
+  parameter and check. Every call site passes it through: `publish_page` with `html`
+  (`service.publish(owner, title, data, page_id, expires_in_days)`), `publish_page` with
+  `upload_id` (`check_can_publish(owner, title, page_id, expires_in_days)` and the same `publish`
+  call), and `publish_page_from_url` (the same two calls).
+- `extend`: `days` not in `1…config.max_expiry_days` →
+  `PageError(f"days must be from 1 to {config.max_expiry_days}.")`; `index.get(owner, page_id)`
+  `None` → the D7 "No page with page_id …" error; `index.set_expiry(owner, page_id, now + days * 86400)`;
+  log `"expiry set page_id=%s owner=%s days=%d"`; return the updated record. The new expiry may be
+  earlier than the old one: the owner chooses the date, the limit is only the maximum.
+- `purge_expired(limit)`: for each `index.expired(limit)` record: `store.delete_page(page_id)`
+  (through `to_thread`); a `StorageError` is logged with
+  `logger.warning("could not delete expired page_id=%s: %s", page_id, exc)` and
+  `index.requeue_expired(page_id)` moves it to the back of the queue (so failing rows never fill
+  every batch), the row being kept for the next run; otherwise `index.remove_expired(page_id)`,
+  counting the page only when that returns `True` (a concurrent purge may have removed it). Logs
+  `"purged %d expired pages"` when the count is above 0; returns the count.
+- `publish` (both tools) calls `purge_expired()` after a successful publish, in its own
+  `try/except Exception: logger.warning("expired-page purge failed", exc_info=True)` so a purge
+  problem never fails a publish (coding guidelines, non-critical side effects).
+
+Tools (`server.py`):
+
+- `publish_page` and `publish_page_from_url` gain a last parameter `expires_in_days: int = 0`,
+  documented as: `How many days the page stays online, 1 to {max}. 0 (the default) means {default}
+  days for a new page and no change for a replacement. Use extend_page_expiry to change it later.`
+  The `{max}` and `{default}` numbers are the configured values: the three descriptions are
+  module-level template strings that `build_server` formats and passes as
+  `server.tool(description=TEMPLATE.format(max=..., default=...), annotations=...)`, so the model
+  sees this deployment's real limits. Both descriptions also gain the sentence `Pages expire: an expired page is deleted
+  and its link stops working.` after the "Give url to the user" sentence.
+- New tool **`extend_page_expiry(page_id: str, days: int) -> dict[str, object]`**, annotations
+  `ToolAnnotations(title="Change HTML page expiry", readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)`:
+
+> Change when one of your HTML pages expires: it will stay online until the given number of days
+> from now, then be deleted.
+>
+> Returns page_id, url and expires_at. The limit is {max} days from now; the date may also be
+> earlier than the current one. A page that has already expired cannot be extended; publish it
+> again instead (it gets a new link). Use list_pages to see each page's expires_at.
+>
+> Args:
+>     page_id: The page_id of one of your pages, from publish_page or list_pages.
+>     days: Days from now until the page expires, 1 to {max}.
+
+  Result `{"page_id", "url", "expires_at"}`; `PageError` → `ToolError`. `destructiveHint` is
+  `False` although the date may move earlier: nothing is deleted by the call, and the earliest
+  possible expiry is a day away (ADR 0021).
+- `list_pages` already returns `expires_at` (p3); expired pages are not listed (D6).
+
+Command line: `purge-expired` (D13) loads the config, builds the store and index, runs
+`purge_expired(limit=PURGE_CLI_BATCH)` in a loop until it returns less than its limit, prints
+`Deleted <n> expired pages.` on stdout and returns 0; the usual errors return 2. It needs no
+`[http]` section and no secret.
 
 ### Rejected alternatives (the ADRs' "Alternatives considered")
 
@@ -1053,6 +1194,15 @@ network operation.
 - **JWT access tokens**: cannot be revoked without a deny list; opaque tokens in SQLite can.
 - **JSON files for state**: several concurrent writers (sign-ins, publishes, uploads) need
   transactions; SQLite is in the standard library.
+- **A readable name in the link** (`/<id>/q3-report.html`, the original design): leaks what the
+  page is about to anyone who sees the link, and adds a slug rule to maintain. The id alone is the
+  address; the title lives in the index.
+- **Pages that never expire**: the pages folder only grows, and nobody notices a forgotten page
+  until the disk fills. **Expiry fixed at publish time**: forces a re-publish (and a new link) to
+  keep a page that is still in use; `extend_page_expiry` keeps the link.
+- **A background task inside the server for purging**: needs its own scheduling and shutdown
+  inside the SDK's app lifespan; a purge after each publish plus an hourly systemd timer is
+  simpler, and the index already hides expired pages in between.
 - **Fetching any URL** for `publish_page_from_url`: a model-supplied address could point at
   cloud metadata endpoints or internal services. An administrator-written host list, https only,
   redirects re-checked against it, and resolved addresses required to be public.
@@ -1072,8 +1222,9 @@ network operation.
   an existing project.)
 - **0012** — Pages are served from a separate host name with a `Content-Security-Policy: sandbox`
   header; the configuration refuses a pages host equal to the server's host.
-- **0013** — A page's link is a random 120-bit id plus a readable slug, open to anyone with the
-  link; ownership lives in a per-person index, and the folder is never listed.
+- **0013** — A page's link is only a random 128-bit id (`https://pages.example.com/<32 hex>/`),
+  with no file name or title in it, open to anyone with the link; ids are checked for uniqueness,
+  ownership lives in a per-person index, and the folder is never listed.
 - **0014** — The server is its own OAuth 2.1 authorization server (dynamic registration, opaque
   tokens hashed in SQLite) and delegates only identity to Google Workspace.
 - **0015** — Dynamic client registration accepts only allowlisted redirect URIs (claude.ai,
@@ -1089,6 +1240,9 @@ network operation.
   directly (never through a proxy), re-checking every redirect and refusing non-public addresses;
   off unless `[fetch]` is configured. Accepted: the DNS re-resolution window, and that a
   proxy-only network cannot use it.
+- **0021** — Every page expires: 90 days by default, at most 365 (both configurable downwards),
+  extendable (or shortened) by its owner; an expired page disappears from its owner's list at once
+  and its files are deleted within about an hour, after the next publish or by an hourly timer.
 
 ## Manual steps
 
@@ -1099,9 +1253,9 @@ public and recorded by a phase.
 After implementation (`manual_after`), on real infrastructure, following the step-by-step page
 (link in the manifest):
 - **ma1** — Create the Google OAuth client, set up an Ubuntu 24.04 server with Caddy and two DNS
-  names, deploy the feature branch, and check the pages host's headers.
-- **ma2** — claude.ai (and Claude Desktop through the same connector): sign in, publish, replace,
-  list, take down, publish from an allowed URL and be refused for another host; a second,
+  names, deploy the feature branch with the purge timer, and check the pages host's headers.
+- **ma2** — claude.ai (and Claude Desktop through the same connector): sign in, publish (the link
+  is an id only), replace, list, extend the expiry, take down, publish from an allowed URL and be refused for another host; a second,
   non-allowed Google account is refused.
 - **ma3** — Claude Code: OAuth sign-in, an API token, and a large page through
   `create_page_upload`.
@@ -1156,7 +1310,7 @@ manual_after:
     title: Create the Google OAuth client and deploy the feature branch on an Ubuntu 24.04 server with Caddy
     why: Real DNS, TLS, Google Workspace sign-in, systemd and Caddy headers cannot run in CI
   - id: ma2-claude-ai
-    title: From claude.ai (and Claude Desktop), sign in, publish, replace, list and take down a page, publish from an allowed URL and be refused for another host; a non-allowed account is refused
+    title: From claude.ai (and Claude Desktop), sign in, publish, replace, list, extend and take down a page, publish from an allowed URL and be refused for another host; a non-allowed account is refused
     why: claude.ai's OAuth client (dynamic registration, callback URL) is only testable against a real public server
   - id: ma3-claude-code
     title: From Claude Code, sign in with OAuth, then with an API token, and publish a large page through create_page_upload
@@ -1170,13 +1324,13 @@ verify_after_merge:
   - bandit -q -c pyproject.toml -r src
 final_checks:
   - docs/publish-pages-plan.md and docs/publish-pages-plan-manual-steps.html are deleted and nothing links to them (grep -rn "publish-pages-plan" . --exclude-dir=.git returns nothing)
-  - ADRs 0011 to 0020 exist, each is Accepted, and each is in docs/adr/README.md's index
-  - CHANGELOG.md has [Unreleased] entries for the tools, sign-in, uploads, fetching by URL and deployment, and no version heading
+  - ADRs 0011 to 0021 exist, each is Accepted, and each is in docs/adr/README.md's index
+  - CHANGELOG.md has [Unreleased] entries for the tools, sign-in, uploads, fetching by URL, id-only links, expiry and deployment, and no version heading
   - echo appears nowhere in src/ or tests/ (grep -rn '"echo"' src tests returns nothing)
   - build.yml dispatched against feature/publish-pages is green, and the run is linked in the PR
 phases:
   - id: p1-config-and-storage
-    title: Configuration file, ids and slugs, local-folder page store
+    title: Configuration file, page ids and links, local-folder page store
     depends_on: []
     complexity: M
     touches:
@@ -1189,7 +1343,7 @@ phases:
       - deploy/config.example.toml
     brief: |
       Read docs/publish-pages-plan.md sections D1, D2, D3, D4 first; they are the spec. Do not edit CHANGELOG.md or
-      pyproject.toml (p3 and p10 own them).
+      pyproject.toml (p3 and p11 own them).
       1. Create src/html_artifact_deploy/pages.py exactly as D3 (module docstring, `from __future__ import annotations`).
       2. Create src/html_artifact_deploy/config.py exactly as D2: the constants (DEFAULT_SECRET_ENV with its nosec
          comment), the four dataclasses, ConfigError, resolve_config_path, load_config (every check in the D2 table, in
@@ -1199,20 +1353,23 @@ phases:
       4. Create deploy/config.example.toml: the D2 example, each key with a one-line comment saying what it is and
          whether it is required.
       5. Tests (marker `unit`, class-per-behaviour, docstring naming the module):
-         - tests/unit/test_pages.py: new_page_id matches PAGE_ID_RE and 1000 calls are distinct; slugify on
-           "Q3 report: Ünits & Co." == "q3-report-units-co", on "" and "!!!" == "page", on "a" * 100 has length 60,
-           on "a" * 59 + " b" equals "a" * 59; clean_title rejects "", "   ", 201 chars and strips; page_url format
-           and its ValueError for a bad id or slug.
+         - tests/unit/test_pages.py: new_page_id fully matches PAGE_ID_RE (32 lowercase hex) and 1000 calls are
+           distinct; is_page_id refuses uppercase hex, 31 and 33 characters, and a trailing newline; clean_title rejects
+           "", "   ", 201 chars and strips; page_url gives f"{base}/{id}/" and raises ValueError for a bad id.
          - tests/unit/test_config.py: a full file (TOML written into tmp_path) loads into the expected Config; a minimal
-           file (only [pages] and [state]) gives http=None, auth=None, stdio_user="local", max_bytes=16_000_000; one
+           file (only [pages] and [state]) gives http=None, auth=None, stdio_user="local", max_bytes=16_000_000,
+           default_expiry_days=90, max_expiry_days=365; max_expiry_days=30 with no default_expiry_days is an error (the
+           default 90 exceeds it) and with default_expiry_days=30 loads; one
            parametrized case per row of the D2 table asserting the exact message; resolve_config_path precedence
            (cli > env > default); require_http error; is_allowed_email (exact address in any case; hd in
            allowed_domains; hd None; hd of another domain; an address whose own domain is allowed but hd is None →
            False); google_client_secret returns the value, and raises the D2 message when unset and when empty;
            deploy/config.example.toml loads with an empty environ.
-         - tests/unit/test_storage.py: write then read back (bytes, file `<root>/<page_id>/<slug>.html`), replace keeps
-           one file and no `.tmp` leftovers, modes 0o755 and 0o644, delete returns True then False, ValueError for a
-           bad id or slug in write and delete, a symlinked page folder is refused in write and delete, check() on a
+         - tests/unit/test_storage.py: write with new=True then read back (bytes, file `<root>/<page_id>/index.html`);
+           new=True on an existing folder raises PageExistsError; new=False replaces, keeps one file and no `.tmp`
+           leftovers; new=False on a missing folder raises D4's "missing" StorageError; modes 0o755 and 0o644; delete
+           returns True then False; ValueError for a bad id in write and delete; a symlinked page folder is refused by
+           write(new=False) and delete; check() on a
            missing root and on a read-only root (chmod 0o555; skip if os.geteuid() == 0), an OSError from os.replace
            removes the temp file and raises StorageError with D4's write message, the same with os.unlink also raising
            (the error still propagates as StorageError), an OSError from tempfile.mkstemp, and an OSError from
@@ -1239,21 +1396,27 @@ phases:
       Read docs/publish-pages-plan.md sections D1, D5, D6 first; they are the spec. Do not edit CHANGELOG.md or
       pyproject.toml.
       1. Create src/html_artifact_deploy/state.py exactly as D5: SCHEMA_VERSION, DB_FILE_NAME, StateError, secret_hash,
-         StateDB with __init__, transaction(), close(). The whole schema-version-1 SQL from D5 (all six tables and three
-         indexes, including the binding_hash, hosted_domain, family and used_at columns) runs in one transaction when
+         StateDB with __init__, transaction(), close(). The whole schema-version-1 SQL from D5 (all six tables and all
+         four indexes, including pages.expires_at and the binding_hash, hosted_domain, family and used_at columns) runs in one transaction when
          user_version is 0.
-      2. Create src/html_artifact_deploy/page_index.py exactly as D6 (PageRecord, PageIndex). Each method uses
-         db.transaction(). `get` filters on both owner and page_id. `list` orders by updated_at DESC, page_id ASC,
-         LIMIT limit. `upsert` is INSERT … ON CONFLICT(page_id) DO UPDATE SET owner, title, slug, bytes, sha256,
-         updated_at (created_at is not overwritten).
+      2. Create src/html_artifact_deploy/page_index.py exactly as D6, every method including the expiry ones (later
+         phases use them; this phase owns the file). Each method uses db.transaction(). "Now" is `int(clock())`.
+         `get` filters on owner, page_id and `expires_at > now`; `get_any` drops the expiry filter. `list` filters on
+         owner and `expires_at > now`, orders by updated_at DESC, page_id ASC, LIMIT limit. `insert` is a plain INSERT
+         (IntegrityError → PageIdTakenError). `update_live` and `set_expiry` update only an unexpired row of that owner
+         and return whether one changed. `expired` orders by expires_at ASC. `clock` is a public attribute.
       3. Tests (marker `unit`), database under tmp_path:
          - tests/unit/test_state.py: a new file gets user_version 1, all six tables and their columns (compare
            `PRAGMA table_info` names with D5); reopening does not re-run the schema; a file with user_version 7 raises
            StateError with the D5 message; the file mode is 0o600; transaction() rolls back on an exception (insert,
            raise, row absent); close() then a transaction raises sqlite3.ProgrammingError; secret_hash equals
            hashlib.sha256 hex.
-         - tests/unit/test_page_index.py: upsert/get round trip; get with another owner returns None; list ordering,
-           limit, other owners' pages excluded; upsert of an existing page keeps created_at; remove returns True then
+         - tests/unit/test_page_index.py (injected clock): an expired row is invisible to get, list and set_expiry but
+           visible to get_any, exists and expired; expired respects its limit and order; remove_expired deletes an
+           expired row and refuses an unexpired one; requeue_expired moves a row behind the others; set_expiry and
+           update_live change a live row, return False for another owner and for an expired row (which stays expired);
+           insert of an existing page_id raises PageIdTakenError; remove works on an expired row; insert/get round trip; get with another owner returns None; list ordering,
+           limit, other owners' pages excluded; update_live keeps created_at; remove returns True then
            False; remove with another owner returns False and leaves the row.
       4. Keep the whole suite at 100% coverage (Risks section command).
     acceptance:
@@ -1300,15 +1463,24 @@ phases:
          MODULE_FLOORS at 100.0, each with a one-line comment (what it guards: the configuration's fail-closed checks;
          writes into the published folder).
       5. Tests:
-         - tests/unit/test_service.py: every step of D7's publish order with its exact message; a replacement keeps slug
-           and created_at and sets created=False; another owner's page_id is refused; StorageError mapping for publish
+         - tests/unit/test_service.py (one injected clock, passed to PageIndex; PageService reads index.clock): every step
+           of D7's publish order except step 2 (p9), with its
+           exact message; a new page's expires_at is now + default_expiry_days days; a replacement keeps created_at,
+           expires_at and the url, and sets created=False; an expired page_id cannot be replaced; when new_page_id is
+           monkeypatched to return an id already in the index, then a fresh one, the fresh one is used; when the store
+           raises PageExistsError three times, the "Could not allocate" error (monkeypatch
+           `html_artifact_deploy.service.new_page_id`); insert raising PageIdTakenError deletes the new folder and gives the
+           "Could not allocate" error; a replacement whose update_live returns False (row expired between get and update:
+           advance the clock inside a fake store's write_page) gives the "No page with page_id" error; unpublish of an
+           expired page whose folder still exists removes it; another owner's page_id is refused; StorageError mapping for publish
            and unpublish (a fake PageStore raising StorageError; the index is unchanged after a failed unpublish);
            unpublish of a page whose folder is already gone succeeds; list clamping (0 → 1, 500 → 200);
            check_can_publish; the log line has page_id and owner and not the title (caplog).
          - tests/unit/test_server.py: rewrite. A fixture builds a real PageService on tmp_path (LocalFolderStore +
            StateDB) and AppContext(owner=lambda: "alice@example.com"). Through `mcp.Client(build_server(...))`: tool list
            == {"publish_page", "list_pages", "unpublish_page", "server_info"}; each tool's annotations equal D8's; every
-           tool has a description; publish → file on disk and url shape; replace; list; unpublish → file gone; each
+           tool has a description; publish → `<root>/<id>/index.html` on disk and url equal to
+           f"https://pages.example.com/{id}/" with no part of the title in it; result includes expires_at; replace; list; unpublish → file gone; each
            ToolError path returns is_error with the exact message (both html and upload_id; neither; upload_id alone;
            unknown page_id; title too long); a second owner cannot see or remove alice's page (a second server with owner
            "bob@example.com" over the same database); server_info unchanged; TestFreshInstances kept.
@@ -1325,7 +1497,7 @@ phases:
            server_info.
       6. README.md: replace the tool table rows with publish_page, list_pages, unpublish_page, server_info (one line each);
          change the Claude Code and Claude Desktop examples to pass `--config ~/html-artifact-deploy.toml`. Leave the rest
-         for p9.
+         for p10.
       7. Full suite at 100% coverage. Then dispatch build.yml against this phase branch (steward table: "The built wheel,
          and its packaged smoke test") and put the run URL and result in the PHASE-REPORT. A red packaged job is this
          phase's to fix.
@@ -1637,12 +1809,66 @@ phases:
       - grep -c "nosec" src/html_artifact_deploy/fetch_client.py prints 0
       - ruff check . && ruff format --check . && python3 scripts/mypy_strict_modules.py && bandit -q -c pyproject.toml -r src pass
 
-  - id: p9-deployment-docs
-    title: systemd unit, Caddyfile, deployment and configuration guides, README
+  - id: p9-expiry
+    title: Page expiry, extend_page_expiry, purge after publish and purge-expired
     depends_on: [p8-url-fetch]
     complexity: M
     touches:
+      - src/html_artifact_deploy/service.py
+      - src/html_artifact_deploy/server.py
+      - src/html_artifact_deploy/__main__.py
+      - tests/unit/test_service.py
+      - tests/unit/test_server.py
+      - tests/unit/test_main.py
+    brief: |
+      Read docs/publish-pages-plan.md sections D2 (expiry keys), D6, D7 (step 2 and the expires_in_days parameter), D8,
+      D13 and D17 first; they are the spec. page_index.py already has every expiry method (p2); do not change it. Do not
+      edit CHANGELOG.md.
+      1. service.py: add `expires_in_days: int = 0` to publish and check_can_publish with D7 step 2; add PURGE_BATCH,
+         extend and purge_expired exactly as D17; call purge_expired after a successful publish inside D17's
+         try/except.
+      2. server.py: add `expires_in_days: int = 0` as the last parameter of publish_page and publish_page_from_url and pass
+         it at all three call sites listed in D17 (html, upload_id, URL), with
+         D17's Args text and the extra sentence; turn these two descriptions and extend_page_expiry's into module-level
+         templates formatted with the configured {max} and {default} and passed as `server.tool(description=...)`;
+         register extend_page_expiry with D17's docstring and annotations (always, over
+         every transport).
+      3. __main__.py: add PURGE_CLI_BATCH and the purge-expired subcommand exactly as D17 / D13.
+      4. Tests (injected clock where expiry matters; for tools, a PageService built with a clock you advance):
+         - tests/unit/test_service.py: expires_in_days 0 / 1 / max / max+1 / -1 on a new page and on a replacement (0
+           keeps the old expiry, n sets now + n days); extend within limits, beyond max, 0, on another owner's page, on an
+           expired page; extend to an earlier date works; purge_expired deletes the folder and the row of an expired
+           page and leaves an unexpired one; a StorageError during purge keeps the row, requeues it behind other expired
+           rows, and logs; a page removed by a concurrent purge (remove_expired returns False) is not counted; the limit is
+           honoured;
+           a purge that raises inside publish is logged and the publish still succeeds (monkeypatch purge_expired to raise).
+         - tests/unit/test_server.py: the tool list now includes extend_page_expiry with D17's annotations; publish_page's
+           and extend_page_expiry's descriptions contain the configured numbers (use max_expiry_days=200,
+           default_expiry_days=30 and assert "200" and "30" appear); publish with expires_in_days; list_pages shows
+           expires_at; after advancing the clock past expiry, list_pages no longer shows the page, extend_page_expiry and
+           unpublish_page give the "No page with page_id" error, and the next publish of another page purges its folder;
+           publish_page_from_url accepts expires_in_days (with the p8 fake fetcher), and so does publish_page with
+           upload_id (an UploadStore as in p7's tests); no tool description in list_tools() contains "{" or "}".
+         - tests/unit/test_main.py: purge-expired with two expired pages and one live page prints
+           "Deleted 2 expired pages." and returns 0, leaving the live page; with PURGE_CLI_BATCH monkeypatched to 1 and
+           three expired pages it loops and prints "Deleted 3 expired pages."; it works with a config that has no [http]
+           section and no secret variable; a bad config returns 2.
+      5. Full suite at 100% coverage.
+      Stop with status=blocked if `server.tool(description=...)` does not override the docstring in list_tools().
+    acceptance:
+      - python3 -m pytest tests/unit/test_service.py tests/unit/test_server.py tests/unit/test_main.py -q passes
+      - python3 -m pytest -q --cov=src/html_artifact_deploy --cov-branch --cov-report=json:coverage.json && python3 scripts/check_coverage_floor.py coverage.json passes
+      - python3 -m html_artifact_deploy --help | grep -c purge-expired prints at least 1
+      - ruff check . && ruff format --check . && python3 scripts/mypy_strict_modules.py && bandit -q -c pyproject.toml -r src pass
+
+  - id: p10-deployment-docs
+    title: systemd unit, Caddyfile, deployment and configuration guides, README
+    depends_on: [p9-expiry]
+    complexity: M
+    touches:
       - deploy/html-artifact-deploy.service
+      - deploy/html-artifact-deploy-purge.service
+      - deploy/html-artifact-deploy-purge.timer
       - deploy/Caddyfile.example
       - docs/deployment.md
       - docs/configuration.md
@@ -1650,10 +1876,10 @@ phases:
       - README.md
       - tests/unit/test_deploy_files.py
     brief: |
-      Read docs/publish-pages-plan.md sections D2, D11, D12, D13, D14, D15, D16 first; they are the spec. Do not edit
+      Read docs/publish-pages-plan.md sections D2, D11, D12, D13, D14, D15, D16, D17 first; they are the spec. Do not edit
       CHANGELOG.md. Standing docs describe today's behaviour only, with no project history (ADR 0008); where a "why" is
-      needed, cite ADRs 0011–0020 by number (p10 writes them; their numbers are fixed by the plan's ADRs section).
-      1. deploy/html-artifact-deploy.service and deploy/Caddyfile.example exactly as D14.
+      needed, cite ADRs 0011–0021 by number (p11 writes them; their numbers are fixed by the plan's ADRs section).
+      1. deploy/html-artifact-deploy.service, the purge .service and .timer, and deploy/Caddyfile.example exactly as D14.
       2. docs/deployment.md: the D14 walkthrough, numbered, every command in a code block. Google steps link
          https://console.cloud.google.com/auth/branding, https://console.cloud.google.com/auth/audience (choose Internal)
          and https://console.cloud.google.com/auth/clients/create. Commands that touch state.dir run as the service user
@@ -1661,18 +1887,23 @@ phases:
          html argument (limited by what the model can write in one tool call; pages.max_bytes on the server), through
          create_page_upload (needs a client that can make an HTTP PUT, such as Claude Code; pages.max_bytes, 15 minutes,
          10 open uploads per person), and through publish_page_from_url (only hosts in fetch.allowed_hosts; https only;
-         pages.max_bytes; fetch.timeout_seconds; why the list exists, citing ADR 0020).
+         pages.max_bytes; fetch.timeout_seconds; why the list exists, citing ADR 0020). A section "Links and expiry"
+         says links are random ids with no name in them (ADR 0013), pages expire after pages.default_expiry_days
+         unless extended with extend_page_expiry up to pages.max_expiry_days, and how to install and check the purge
+         timer (`systemctl enable --now html-artifact-deploy-purge.timer`, `systemctl list-timers`) (ADR 0021).
       3. docs/configuration.md: one table per section of D2 (key, type, required/default, meaning), the environment
          variables (HTML_ARTIFACT_DEPLOY_CONFIG and the client-secret variable) and the D13 commands.
       4. docs/README.md: add deployment.md and configuration.md under "Using HTML Artifact Deploy".
       5. README.md: rewrite "Connect a client" as D15 (four subsections), add a short "Run your own server" paragraph
          linking docs/deployment.md, and add rows to the tool table for create_page_upload ("HTTP only") and
-         publish_page_from_url ("only when [fetch] is configured").
+         publish_page_from_url ("only when [fetch] is configured") and extend_page_expiry.
       6. tests/unit/test_deploy_files.py (marker `unit`): every key in deploy/config.example.toml appears in
          docs/configuration.md (parse the TOML, then search the doc text for each `key`); the Caddyfile's pages site
          contains the exact Content-Security-Policy value from D14 and no `browse`; the systemd unit contains ExecStart with
          `serve-http`, EnvironmentFile, ReadWritePaths=/srv/pages and NoNewPrivileges=yes; docs/deployment.md contains
-         the strings "create_page_upload", "publish_page_from_url" and "fetch.allowed_hosts".
+         the strings "create_page_upload", "publish_page_from_url", "fetch.allowed_hosts", "extend_page_expiry" and
+         "html-artifact-deploy-purge.timer"; the purge timer has OnCalendar=hourly and the purge service runs
+         `purge-expired` with Type=oneshot.
       7. python3 -m pytest tests/unit/test_no_project_history.py -q must pass.
       Stop with status=blocked if a D13 command or a D2 key the docs must describe does not exist in the code as merged.
     acceptance:
@@ -1681,14 +1912,14 @@ phases:
       - grep -c "docs/deployment.md" README.md prints at least 1
       - python3 -m pytest -q passes
 
-  - id: p10-adrs-and-retire
-    title: ADRs 0011–0020, changelog, reference-doc touch-ups, delete the plan
-    depends_on: [p9-deployment-docs]
+  - id: p11-adrs-and-retire
+    title: ADRs 0011–0021, changelog, reference-doc touch-ups, delete the plan
+    depends_on: [p10-deployment-docs]
     complexity: M
     touches:
       - docs/adr/0011-a-standalone-server-that-writes-into-the-web-servers-folder.md
       - docs/adr/0012-pages-are-served-from-a-separate-sandboxed-host-name.md
-      - docs/adr/0013-a-page-link-is-a-random-id-plus-a-slug-and-ownership-is-an-index.md
+      - docs/adr/0013-a-page-link-is-only-a-random-id-and-ownership-is-an-index.md
       - docs/adr/0014-the-server-is-its-own-oauth-server-and-google-only-proves-identity.md
       - docs/adr/0015-client-registration-accepts-only-allowlisted-redirect-uris.md
       - docs/adr/0016-google-id-tokens-are-trusted-by-tls-not-by-signature.md
@@ -1696,6 +1927,7 @@ phases:
       - docs/adr/0018-large-pages-arrive-through-one-time-upload-urls.md
       - docs/adr/0019-streamable-http-is-stateless-and-starlette-and-uvicorn-are-declared.md
       - docs/adr/0020-pages-are-fetched-only-from-allowlisted-https-hosts.md
+      - docs/adr/0021-every-page-expires-and-its-owner-can-extend-it.md
       - docs/adr/README.md
       - docs/live-qa.md
       - docs/testing-policy.md
@@ -1703,29 +1935,30 @@ phases:
       - docs/publish-pages-plan.md
       - docs/publish-pages-plan-manual-steps.html
     brief: |
-      1. Write ADRs 0011–0020 from the plan's "ADRs" list, with the file names in `touches` and docs/adr/README.md's
+      1. Write ADRs 0011–0021 from the plan's "ADRs" list, with the file names in `touches` and docs/adr/README.md's
          template. Context and Decision come from the matching D-section; "Alternatives considered" from the plan's
          "Rejected alternatives" bullets for that decision; Verification names the enforcing files and tests (for example
          0012 → config.py's host check and tests/unit/test_config.py, deploy/Caddyfile.example and
          tests/unit/test_deploy_files.py). Status `Accepted — <today's date>.` Related: source files, and ADRs 0003,
          0007 and 0010 where relevant; never the plan document.
-      2. docs/adr/README.md: add the ten rows to the index.
+      2. docs/adr/README.md: add the eleven rows to the index.
       3. docs/live-qa.md: a short section saying the google_openid_configuration check needs no QA account or
          credentials, so it can run anywhere (it still runs weekly on the runner with the others).
       4. docs/testing-policy.md: in "Layer 5", one sentence naming google_openid_configuration as the only live check and
          what it guards (Google's authorization and token endpoints).
       5. CHANGELOG.md under ## [Unreleased]: ### Added, replacing the skeleton line: the publish_page, list_pages and
          unpublish_page tools; Google Workspace sign-in for claude.ai, Claude Desktop and Claude Code over Streamable
-         HTTP; API tokens; create_page_upload; publish_page_from_url for allowlisted hosts; stdio with --config; the deploy/ examples and the deployment and
+         HTTP; API tokens; create_page_upload; publish_page_from_url for allowlisted hosts; links that are random ids only; page expiry
+         (90 days by default, at most 365) with extend_page_expiry and the purge-expired command and timer; stdio with --config; the deploy/ examples and the deployment and
          configuration guides. ### Removed: the placeholder echo tool.
       6. git rm docs/publish-pages-plan.md docs/publish-pages-plan-manual-steps.html; grep -rn "publish-pages-plan" .
          --exclude-dir=.git must return nothing.
       7. Dispatch build.yml against this phase branch and report the run.
-      Stop with status=blocked if an ADR number 0011–0020 is already taken on main when you start (renumbering is then
-      the orchestrator's call, since p9's docs cite the numbers).
+      Stop with status=blocked if an ADR number 0011–0021 is already taken on main when you start (renumbering is then
+      the orchestrator's call, since p10's docs cite the numbers).
     acceptance:
-      - ls docs/adr/00{11,12,13,14,15,16,17,18,19,20}-*.md lists ten files
-      - grep -cE "^\| \[00(1[1-9]|20)\]" docs/adr/README.md prints 10
+      - ls docs/adr/00{11,12,13,14,15,16,17,18,19,20,21}-*.md lists eleven files
+      - grep -cE "^\| \[00(1[1-9]|2[01])\]" docs/adr/README.md prints 11
       - test ! -e docs/publish-pages-plan.md && test ! -e docs/publish-pages-plan-manual-steps.html
       - grep -rn "publish-pages-plan" . --exclude-dir=.git returns nothing
       - python3 -m pytest -q passes (including test_no_project_history)
