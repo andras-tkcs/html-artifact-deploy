@@ -68,7 +68,8 @@ an issue when one breaks; it gates nothing.
 
 Live credentials exist only on the project's self-hosted runner, as local files — never as GitHub
 Actions secrets, never on a GitHub-hosted runner, never reachable from a `pull_request` trigger
-(ADR 0007). Setup is [`live-qa.md`](live-qa.md).
+(ADR 0007). Setup is [`live-qa.md`](live-qa.md). The only live check is `google_openid_configuration`,
+which guards the shape of Google's authorization and token endpoints.
 
 - **`live-check.yml`** — weekly and on dispatch. Runs `scripts/live_check.py --check` over every
   registered check. A failure is provider drift or an expired QA grant; both need a person.
