@@ -28,6 +28,7 @@ from .service import PageService
 from .state import DB_FILE_NAME, StateDB
 from .storage import LocalFolderStore
 from .token_store import TokenStore
+from .uploads import UPLOAD_PATH, UploadStore
 
 MCP_PATH = "/mcp"
 HEALTH_PATH = "/healthz"
@@ -62,19 +63,21 @@ def build_http_app(
     store = LocalFolderStore(config.pages.root)
     store.check()
     service = PageService(config.pages, store, PageIndex(db, clock=clock))
+    uploads = UploadStore(db, config.state_dir / "uploads", http.public_url, config.pages.max_bytes, clock=clock)
     tokens = TokenStore(db, clock=clock)
     google = google or GoogleOidcClient(auth.google_client_id, google_client_secret(auth, environ))
     provider = GoogleOAuthProvider(auth, http, tokens, google, clock=clock)
     # The SDK's protocol has an optional member, exchange_identity_assertion, that the provider omits; the
     # SDK calls it only when AuthSettings.identity_assertion_enabled is set, and auth_settings leaves it off.
     server = build_server(
-        AppContext(service, _owner),
+        AppContext(service, _owner, uploads),
         auth_server_provider=provider,  # type: ignore[arg-type]
         auth=auth_settings(http),
     )
     # Every custom_route call must come before streamable_http_app: the SDK copies the route list then.
     server.custom_route(START_PATH, ["GET"])(provider.handle_google_start)
     server.custom_route(CALLBACK_PATH, ["GET"])(provider.handle_google_callback)
+    server.custom_route(UPLOAD_PATH, ["PUT"])(uploads.handle_put)
     server.custom_route(HEALTH_PATH, ["GET"])(_health)
     public_host = urlsplit(http.public_url).netloc
     return server.streamable_http_app(

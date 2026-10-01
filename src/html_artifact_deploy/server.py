@@ -23,6 +23,7 @@ from mcp.types import ToolAnnotations
 
 from . import __version__
 from .service import PageError, PageService
+from .uploads import UploadError, UploadStore
 
 SERVER_NAME = "html-artifact-deploy"
 
@@ -31,6 +32,7 @@ SERVER_NAME = "html-artifact-deploy"
 class AppContext:
     service: PageService
     owner: Callable[[], str]  # who is calling; raises ToolError("Not signed in.") if unknown
+    uploads: UploadStore | None = None  # None over stdio, where there is no URL to PUT to
 
 
 def _iso(timestamp: int) -> str:
@@ -76,12 +78,19 @@ def build_server(
         """
         if bool(html) == bool(upload_id):
             raise ToolError("Give exactly one of html and upload_id.")
-        if upload_id:
+        uploads = app.uploads
+        if upload_id and uploads is None:
             raise ToolError("Uploads are not available on this connection; pass the page as html.")
         owner = app.owner()
         try:
-            result = await app.service.publish(owner, title, html.encode("utf-8"), page_id)
-        except PageError as error:
+            if uploads is not None and upload_id:
+                await app.service.check_can_publish(owner, title, page_id)
+                data = await uploads.read(owner, upload_id)
+                result = await app.service.publish(owner, title, data, page_id)
+                await uploads.discard(upload_id)
+            else:
+                result = await app.service.publish(owner, title, html.encode("utf-8"), page_id)
+        except (PageError, UploadError) as error:
             raise ToolError(str(error)) from error
         record = result.record
         return {
@@ -151,6 +160,39 @@ def build_server(
         except PageError as error:
             raise ToolError(str(error)) from error
         return {"page_id": record.page_id, "url": app.service.url_for(record), "removed": True}
+
+    uploads = app.uploads
+    if uploads is not None:
+
+        @server.tool(
+            annotations=ToolAnnotations(
+                title="Create page upload URL",
+                read_only_hint=False,
+                destructive_hint=False,
+                idempotent_hint=False,
+                open_world_hint=False,
+            )
+        )
+        async def create_page_upload() -> dict[str, object]:
+            """Create a one-time URL to upload a large HTML page to, for publish_page.
+
+            Returns upload_id, upload_url, method (always PUT), max_bytes and expires_at. Send the file's
+            bytes as the body of an HTTP PUT to upload_url within 15 minutes, for example
+            `curl --upload-file page.html "<upload_url>"`, then call publish_page with upload_id and no html.
+            Only useful when you can make HTTP requests or run commands (for example in Claude Code); otherwise
+            pass the page to publish_page as html.
+            """
+            try:
+                slot = await uploads.create(app.owner())
+            except UploadError as error:
+                raise ToolError(str(error)) from error
+            return {
+                "upload_id": slot.upload_id,
+                "upload_url": slot.upload_url,
+                "method": "PUT",
+                "max_bytes": slot.max_bytes,
+                "expires_at": _iso(slot.expires_at),
+            }
 
     @server.tool()
     def server_info() -> dict[str, str]:
