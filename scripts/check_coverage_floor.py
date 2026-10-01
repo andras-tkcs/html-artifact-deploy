@@ -37,6 +37,12 @@ MODULE_FLOORS: dict[str, float] = {
     "src/html_artifact_deploy/config.py": 100.0,
     # Writes into the published folder.
     "src/html_artifact_deploy/storage.py": 100.0,
+    # Stores and checks every bearer token and sign-in secret.
+    "src/html_artifact_deploy/token_store.py": 100.0,
+    # Decides who may sign in and which redirect URIs receive a code.
+    "src/html_artifact_deploy/oauth_provider.py": 100.0,
+    # Wires authentication, host checks and body limits around the tools.
+    "src/html_artifact_deploy/http_app.py": 100.0,
 }
 
 

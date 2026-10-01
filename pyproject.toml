@@ -27,6 +27,9 @@ dependencies = [
     # The official SDK serves the protocol; the transport is not hand-rolled (ADR 0003). 2.x's
     # server API is not additive over 1.x, hence the floor and the ceiling.
     "mcp>=2.2,<3.0.0",
+    # Imported directly by http_app.py and __main__.py; mcp already installs both (ADR 0019).
+    "starlette>=1.0,<2.0",
+    "uvicorn>=0.30,<1.0",
 ]
 
 [project.urls]
@@ -97,6 +100,11 @@ module = [
     "html_artifact_deploy.state",
     "html_artifact_deploy.page_index",
     "html_artifact_deploy.service",
+    "html_artifact_deploy.google_oidc_client",
+    "html_artifact_deploy.token_store",
+    "html_artifact_deploy.oauth_provider",
+    "html_artifact_deploy.http_app",
+    "html_artifact_deploy.__main__",
 ]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
