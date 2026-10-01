@@ -69,11 +69,9 @@ def build_http_app(
     tokens = TokenStore(db, clock=clock)
     google = google or GoogleOidcClient(auth.google_client_id, google_client_secret(auth, environ))
     provider = GoogleOAuthProvider(auth, http, tokens, google, clock=clock)
-    # The SDK's protocol has an optional member, exchange_identity_assertion, that the provider omits; the
-    # SDK calls it only when AuthSettings.identity_assertion_enabled is set, and auth_settings leaves it off.
     server = build_server(
         AppContext(service, _owner, uploads, fetcher),
-        auth_server_provider=provider,  # type: ignore[arg-type]
+        auth_server_provider=provider,
         auth=auth_settings(http),
     )
     # Every custom_route call must come before streamable_http_app: the SDK copies the route list then.

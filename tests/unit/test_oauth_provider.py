@@ -24,6 +24,7 @@ from mcp.server.auth.provider import (
     AuthorizationCode,
     AuthorizationParams,
     AuthorizeError,
+    IdentityAssertionParams,
     RegistrationError,
     TokenError,
 )
@@ -719,6 +720,12 @@ class TestDirectCalls:
         with pytest.raises(TokenError) as caught:
             await provider.exchange_refresh_token(client_info(), loaded, ["pages"])
         assert caught.value.error == "invalid_grant"
+
+    async def test_identity_assertion_is_refused(self, timed: tuple[GoogleOAuthProvider, TokenStore]) -> None:
+        provider, _ = timed
+        with pytest.raises(TokenError) as caught:
+            await provider.exchange_identity_assertion(client_info(), IdentityAssertionParams(assertion="a.b.c"))
+        assert caught.value.error == "unsupported_grant_type"
 
 
 def test_auth_settings() -> None:
