@@ -28,6 +28,70 @@ from .uploads import UploadError, UploadStore
 
 SERVER_NAME = "html-artifact-deploy"
 
+EXPIRES_ARG = (
+    "How many days the page stays online, 1 to {max}. 0 (the default) means {default} days for a new "
+    "page and no change for a replacement. Use extend_page_expiry to change it later."
+)
+
+PUBLISH_PAGE_DESCRIPTION = (
+    """Publish a single-file HTML page on your organization's page server and return its link.
+
+Pass the whole HTML document as html, with CSS and scripts inline or loaded from public CDNs.
+For a page over about 100 KB, when create_page_upload is available, upload the file first and
+pass upload_id instead. If the page is already online, publish_page_from_url (when available)
+fetches it from its address instead. Returns page_id, url, title, bytes, created (false when an existing page
+was replaced), updated_at and expires_at. Give url to the user: anyone with that link can open
+the page until it expires. Pages expire: an expired page is deleted and its link stops working.
+To change a page you published, call this again with its page_id;
+the page is replaced and keeps its url. Use list_pages to find a page_id, and unpublish_page to
+take a page down.
+
+Args:
+    title: What the page is, in words, for example "Q3 report". 1 to 200 characters. It is
+        shown in list_pages only; the link is a random id and never contains it.
+    html: The complete HTML document. Give exactly one of html and upload_id.
+    upload_id: The upload_id from create_page_upload, after the file was PUT to its upload_url.
+        Empty when html is given.
+    page_id: The page_id of a page you published, to replace it. Empty to publish a new page.
+    expires_in_days: """
+    + EXPIRES_ARG
+    + "\n"
+)
+
+PUBLISH_PAGE_FROM_URL_DESCRIPTION = (
+    """Publish a single-file HTML page that is already online, by its https address, and return its link.
+
+The server downloads the file itself, so the page does not have to pass through this
+conversation; use it for large pages. The address must be on a host this server allows (an error
+names them) and must return the file to a plain GET with no sign-in, for example a raw file on a
+Git host or a presigned storage link. Returns page_id, url, title, bytes, created, updated_at
+and expires_at, as publish_page does. Give url to the user: anyone with that link can open
+the page until it expires. Pages expire: an expired page is deleted and its link stops working.
+To change a page you published, pass its page_id; the page
+is replaced and keeps its url. For a page you have as text, use publish_page.
+
+Args:
+    title: What the page is, in words, for example "Q3 report". 1 to 200 characters. It is
+        shown in list_pages only; the link is a random id and never contains it.
+    url: The https address of the HTML file.
+    page_id: The page_id of a page you published, to replace it. Empty to publish a new page.
+    expires_in_days: """
+    + EXPIRES_ARG
+    + "\n"
+)
+
+EXTEND_PAGE_EXPIRY_DESCRIPTION = """Change when one of your HTML pages expires: it will stay online until the given number of days
+from now, then be deleted.
+
+Returns page_id, url and expires_at. The limit is {max} days from now; the date may also be
+earlier than the current one. A page that has already expired cannot be extended; publish it
+again instead (it gets a new link). Use list_pages to see each page's expires_at.
+
+Args:
+    page_id: The page_id of one of your pages, from publish_page or list_pages.
+    days: Days from now until the page expires, 1 to {max}.
+"""
+
 
 @dataclass(frozen=True)
 class AppContext:
@@ -62,36 +126,21 @@ def build_server(
 ) -> MCPServer:
     """Build the server with every tool registered."""
     server = MCPServer(SERVER_NAME, auth_server_provider=auth_server_provider, auth=auth)
+    limits = {"max": app.service.config.max_expiry_days, "default": app.service.config.default_expiry_days}
 
     @server.tool(
+        description=PUBLISH_PAGE_DESCRIPTION.format(**limits),
         annotations=ToolAnnotations(
             title="Publish HTML page",
             read_only_hint=False,
             destructive_hint=False,
             idempotent_hint=False,
             open_world_hint=True,
-        )
+        ),
     )
-    async def publish_page(title: str, html: str = "", upload_id: str = "", page_id: str = "") -> dict[str, object]:
-        """Publish a single-file HTML page on your organization's page server and return its link.
-
-        Pass the whole HTML document as html, with CSS and scripts inline or loaded from public CDNs.
-        For a page over about 100 KB, when create_page_upload is available, upload the file first and
-        pass upload_id instead. If the page is already online, publish_page_from_url (when available)
-        fetches it from its address instead. Returns page_id, url, title, bytes, created (false when an existing page
-        was replaced), updated_at and expires_at. Give url to the user: anyone with that link can open
-        the page until it expires. To change a page you published, call this again with its page_id;
-        the page is replaced and keeps its url. Use list_pages to find a page_id, and unpublish_page to
-        take a page down.
-
-        Args:
-            title: What the page is, in words, for example "Q3 report". 1 to 200 characters. It is
-                shown in list_pages only; the link is a random id and never contains it.
-            html: The complete HTML document. Give exactly one of html and upload_id.
-            upload_id: The upload_id from create_page_upload, after the file was PUT to its upload_url.
-                Empty when html is given.
-            page_id: The page_id of a page you published, to replace it. Empty to publish a new page.
-        """
+    async def publish_page(
+        title: str, html: str = "", upload_id: str = "", page_id: str = "", expires_in_days: int = 0
+    ) -> dict[str, object]:
         if bool(html) == bool(upload_id):
             raise ToolError("Give exactly one of html and upload_id.")
         uploads = app.uploads
@@ -100,12 +149,12 @@ def build_server(
         owner = app.owner()
         try:
             if uploads is not None and upload_id:
-                await app.service.check_can_publish(owner, title, page_id)
+                await app.service.check_can_publish(owner, title, page_id, expires_in_days)
                 data = await uploads.read(owner, upload_id)
-                result = await app.service.publish(owner, title, data, page_id)
+                result = await app.service.publish(owner, title, data, page_id, expires_in_days)
                 await uploads.discard(upload_id)
             else:
-                result = await app.service.publish(owner, title, html.encode("utf-8"), page_id)
+                result = await app.service.publish(owner, title, html.encode("utf-8"), page_id, expires_in_days)
         except (PageError, UploadError) as error:
             raise ToolError(str(error)) from error
         return _publish_result(result)
@@ -168,6 +217,23 @@ def build_server(
             raise ToolError(str(error)) from error
         return {"page_id": record.page_id, "url": app.service.url_for(record), "removed": True}
 
+    @server.tool(
+        description=EXTEND_PAGE_EXPIRY_DESCRIPTION.format(**limits),
+        annotations=ToolAnnotations(
+            title="Change HTML page expiry",
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=True,
+            open_world_hint=False,
+        ),
+    )
+    async def extend_page_expiry(page_id: str, days: int) -> dict[str, object]:
+        try:
+            record = await app.service.extend(app.owner(), page_id, days)
+        except PageError as error:
+            raise ToolError(str(error)) from error
+        return {"page_id": record.page_id, "url": app.service.url_for(record), "expires_at": _iso(record.expires_at)}
+
     uploads = app.uploads
     if uploads is not None:
 
@@ -205,35 +271,23 @@ def build_server(
     if fetcher is not None:
 
         @server.tool(
+            description=PUBLISH_PAGE_FROM_URL_DESCRIPTION.format(**limits),
             annotations=ToolAnnotations(
                 title="Publish HTML page from URL",
                 read_only_hint=False,
                 destructive_hint=False,
                 idempotent_hint=False,
                 open_world_hint=True,
-            )
+            ),
         )
-        async def publish_page_from_url(title: str, url: str, page_id: str = "") -> dict[str, object]:
-            """Publish a single-file HTML page that is already online, by its https address, and return its link.
-
-            The server downloads the file itself, so the page does not have to pass through this
-            conversation; use it for large pages. The address must be on a host this server allows (an error
-            names them) and must return the file to a plain GET with no sign-in, for example a raw file on a
-            Git host or a presigned storage link. Returns page_id, url, title, bytes, created, updated_at
-            and expires_at, as publish_page does. To change a page you published, pass its page_id; the page
-            is replaced and keeps its url. For a page you have as text, use publish_page.
-
-            Args:
-                title: What the page is, in words, for example "Q3 report". 1 to 200 characters. It is
-                    shown in list_pages only; the link is a random id and never contains it.
-                url: The https address of the HTML file.
-                page_id: The page_id of a page you published, to replace it. Empty to publish a new page.
-            """
+        async def publish_page_from_url(
+            title: str, url: str, page_id: str = "", expires_in_days: int = 0
+        ) -> dict[str, object]:
             owner = app.owner()
             try:
-                await app.service.check_can_publish(owner, title, page_id)
+                await app.service.check_can_publish(owner, title, page_id, expires_in_days)
                 data = await fetcher.fetch(url)
-                result = await app.service.publish(owner, title, data, page_id)
+                result = await app.service.publish(owner, title, data, page_id, expires_in_days)
             except (PageError, FetchClientError) as error:
                 raise ToolError(str(error)) from error
             return _publish_result(result)

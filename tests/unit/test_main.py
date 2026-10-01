@@ -196,3 +196,50 @@ class TestServeHttp:
         config = _write_config(tmp_path, auth=True)
         assert entry.main(["--config", str(config), "serve-http"], {}) == 2
         assert SECRET_ENV in capsys.readouterr().err
+
+
+class TestPurgeExpired:
+    def _publish(self, config_path: Path, count: int, days: int) -> None:
+        import asyncio
+        import time
+
+        from html_artifact_deploy.config import load_config
+        from html_artifact_deploy.page_index import PageIndex
+        from html_artifact_deploy.service import PageService
+        from html_artifact_deploy.state import DB_FILE_NAME, StateDB
+        from html_artifact_deploy.storage import LocalFolderStore
+
+        config = load_config(config_path, {})
+        service = PageService(
+            config.pages,
+            LocalFolderStore(config.pages.root),
+            PageIndex(StateDB(config.state_dir / DB_FILE_NAME), clock=lambda: time.time() - 3 * 86400),
+        )
+        for _ in range(count):
+            asyncio.run(service.publish("a@example.com", "t", b"<p>x</p>", expires_in_days=days))
+
+    def test_deletes_expired_pages_and_leaves_live_ones(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = _write_config(tmp_path)
+        self._publish(config, 2, 1)
+        self._publish(config, 1, 30)
+        assert entry.main(["--config", str(config), "purge-expired"], {}) == 0
+        assert capsys.readouterr().out == "Deleted 2 expired pages.\n"
+        assert len(list((tmp_path / "pages").iterdir())) == 1
+
+    def test_loops_over_batches(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = _write_config(tmp_path)
+        self._publish(config, 3, 1)
+        monkeypatch.setattr(entry, "PURGE_CLI_BATCH", 1)
+        assert entry.main(["--config", str(config), "purge-expired"], {}) == 0
+        assert capsys.readouterr().out == "Deleted 3 expired pages.\n"
+        assert list((tmp_path / "pages").iterdir()) == []
+
+    def test_bad_config_is_2(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        bad = tmp_path / "bad.toml"
+        bad.write_text("not toml [", encoding="utf-8")
+        assert entry.main(["--config", str(bad), "purge-expired"], {}) == 2
+        assert "not valid TOML" in capsys.readouterr().err
