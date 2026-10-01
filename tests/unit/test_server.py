@@ -12,6 +12,9 @@ from pathlib import Path
 import pytest
 from mcp import Client
 from mcp.types import CallToolResult, ToolAnnotations
+from starlette.applications import Starlette
+from starlette.routing import Route
+from starlette.testclient import TestClient
 
 from html_artifact_deploy import __version__
 from html_artifact_deploy.config import PagesConfig
@@ -20,6 +23,7 @@ from html_artifact_deploy.server import SERVER_NAME, AppContext, build_server
 from html_artifact_deploy.service import PageService
 from html_artifact_deploy.state import DB_FILE_NAME, StateDB
 from html_artifact_deploy.storage import LocalFolderStore
+from html_artifact_deploy.uploads import UPLOAD_PATH, UploadStore
 
 pytestmark = pytest.mark.unit
 
@@ -36,9 +40,20 @@ class Env:
         config = PagesConfig(root=self.root, public_base_url=BASE)
         index = PageIndex(StateDB(tmp_path / "state" / DB_FILE_NAME))
         self.service = PageService(config, LocalFolderStore(self.root), index)
+        self.uploads = UploadStore(StateDB(tmp_path / "state" / "up.sqlite3"), tmp_path / "uploads", BASE, 10_000)
+        self.with_uploads = False
 
     def server(self, owner: str = ALICE):  # type: ignore[no-untyped-def]
-        return build_server(AppContext(self.service, owner=lambda: owner))
+        uploads = self.uploads if self.with_uploads else None
+        return build_server(AppContext(self.service, owner=lambda: owner, uploads=uploads))
+
+    async def upload(self, owner: str, body: bytes) -> str:
+        """Create a slot for `owner` and PUT `body` to it through the real handler."""
+        slot = await self.uploads.create(owner)
+        app = Starlette(routes=[Route(UPLOAD_PATH, self.uploads.handle_put, methods=["PUT"])])
+        with TestClient(app) as client:
+            assert client.put(f"/uploads/{slot.upload_id}", content=body).status_code == 201
+        return slot.upload_id
 
 
 @pytest.fixture
@@ -141,6 +156,71 @@ class TestPublishPage:
         result = await _call(env, "publish_page", args)
         assert result.is_error
         assert _text(result) == f"Error executing tool publish_page: {message}"
+
+
+class TestUploads:
+    async def test_tool_is_listed_with_its_annotations(self, env: Env) -> None:
+        env.with_uploads = True
+        async with Client(env.server()) as client:
+            tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+        assert tools["create_page_upload"].annotations == ToolAnnotations(
+            title="Create page upload URL",
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=False,
+        )
+        assert tools["create_page_upload"].description
+
+    async def test_create_page_upload_result(self, env: Env) -> None:
+        env.with_uploads = True
+        result = await _call(env, "create_page_upload", {})
+        data = result.structured_content
+        assert data is not None
+        assert data["upload_url"] == f"{BASE}/uploads/{data['upload_id']}"
+        assert (data["method"], data["max_bytes"]) == ("PUT", 10_000)
+        assert str(data["expires_at"]).endswith("+00:00")
+
+    async def test_create_page_upload_reports_the_open_slot_limit(self, env: Env) -> None:
+        env.with_uploads = True
+        for _ in range(10):
+            await _call(env, "create_page_upload", {})
+        result = await _call(env, "create_page_upload", {})
+        assert result.is_error
+        assert "You have 10 uploads waiting." in _text(result)
+
+    async def test_publish_via_upload_id_discards_the_upload(self, env: Env) -> None:
+        env.with_uploads = True
+        upload_id = await env.upload(ALICE, HTML.encode())
+        result = await _call(env, "publish_page", {"title": "Big", "upload_id": upload_id})
+        data = result.structured_content
+        assert data is not None
+        assert (env.root / str(data["page_id"]) / "index.html").read_text(encoding="utf-8") == HTML
+        again = await _call(env, "publish_page", {"title": "Big", "upload_id": upload_id})
+        assert again.is_error
+        assert "No uploaded file for that upload_id." in _text(again)
+
+    async def test_bad_title_does_not_consume_the_upload(self, env: Env) -> None:
+        env.with_uploads = True
+        upload_id = await env.upload(ALICE, HTML.encode())
+        bad = await _call(env, "publish_page", {"title": "", "upload_id": upload_id})
+        assert "title must be 1 to 200 characters." in _text(bad)
+        good = await _call(env, "publish_page", {"title": "ok", "upload_id": upload_id})
+        assert not good.is_error
+
+    async def test_failed_publish_keeps_the_upload(self, env: Env) -> None:
+        env.with_uploads = True
+        upload_id = await env.upload(ALICE, b"\xff\xfe")
+        bad = await _call(env, "publish_page", {"title": "t", "upload_id": upload_id})
+        assert "not UTF-8" in _text(bad)
+        assert await env.uploads.read(ALICE, upload_id) == b"\xff\xfe"
+
+    async def test_without_a_store_the_tool_is_absent_and_upload_id_is_refused(self, env: Env) -> None:
+        async with Client(env.server()) as client:
+            names = {tool.name for tool in (await client.list_tools()).tools}
+        assert "create_page_upload" not in names
+        result = await _call(env, "publish_page", {"title": "t", "upload_id": "u"})
+        assert "Uploads are not available on this connection" in _text(result)
 
 
 class TestListPages:

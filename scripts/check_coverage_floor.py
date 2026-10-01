@@ -43,6 +43,8 @@ MODULE_FLOORS: dict[str, float] = {
     "src/html_artifact_deploy/oauth_provider.py": 100.0,
     # Wires authentication, host checks and body limits around the tools.
     "src/html_artifact_deploy/http_app.py": 100.0,
+    # Accepts file bodies from callers who hold only a one-time URL.
+    "src/html_artifact_deploy/uploads.py": 100.0,
 }
 
 

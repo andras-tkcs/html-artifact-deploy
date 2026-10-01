@@ -100,6 +100,37 @@ class TestRoutes:
         assert response.status_code == 400
 
 
+class TestUploadRoute:
+    async def test_put_needs_no_bearer_token_but_mcp_does(self, tmp_path: Path) -> None:
+        async with _client(build_http_app(_config(tmp_path), environ=ENVIRON)) as client:
+            upload = await client.put("/uploads/unknown", content=b"x")
+            mcp = await client.post("/mcp", json=_rpc("initialize", _INIT))
+        assert (upload.status_code, upload.text) == (404, "Unknown or expired upload.")
+        assert mcp.status_code == 401
+
+    async def test_create_page_upload_is_listed_and_the_url_accepts_the_file(self, tmp_path: Path) -> None:
+        app = build_http_app(_config(tmp_path), environ=ENVIRON)
+        async with _client(app, _token(tmp_path)) as client:
+            tools = await client.post("/mcp", json=_rpc("tools/list"))
+            created = await client.post(
+                "/mcp", json=_rpc("tools/call", {"name": "create_page_upload", "arguments": {}}, 2)
+            )
+            slot = created.json()["result"]["structuredContent"]
+            put = await client.put(slot["upload_url"], content=b"<p>big</p>", headers={"Content-Type": "text/html"})
+            published = await client.post(
+                "/mcp",
+                json=_rpc(
+                    "tools/call",
+                    {"name": "publish_page", "arguments": {"title": "Big", "upload_id": slot["upload_id"]}},
+                    3,
+                ),
+            )
+        assert "create_page_upload" in {tool["name"] for tool in tools.json()["result"]["tools"]}
+        assert put.status_code == 201
+        page_id = published.json()["result"]["structuredContent"]["page_id"]
+        assert (tmp_path / "pages" / page_id / "index.html").read_text() == "<p>big</p>"
+
+
 class TestMcp:
     async def test_no_token_is_401(self, tmp_path: Path) -> None:
         async with _client(build_http_app(_config(tmp_path), environ=ENVIRON)) as client:

@@ -104,6 +104,7 @@ module = [
     "html_artifact_deploy.token_store",
     "html_artifact_deploy.oauth_provider",
     "html_artifact_deploy.http_app",
+    "html_artifact_deploy.uploads",
     "html_artifact_deploy.__main__",
 ]
 disallow_untyped_defs = true
