@@ -1,0 +1,17 @@
+[Unit]
+Description=Delete expired HTML Artifact Deploy pages
+
+[Service]
+Type=oneshot
+User=html-artifact-deploy
+Group=html-artifact-deploy
+StateDirectory=html-artifact-deploy
+ReadWritePaths=/srv/pages
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0022
+ExecStart=/opt/html-artifact-deploy/bin/html-artifact-deploy --config /etc/html-artifact-deploy/config.toml purge-expired
