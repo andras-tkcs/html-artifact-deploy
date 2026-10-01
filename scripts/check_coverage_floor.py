@@ -45,6 +45,8 @@ MODULE_FLOORS: dict[str, float] = {
     "src/html_artifact_deploy/http_app.py": 100.0,
     # Accepts file bodies from callers who hold only a one-time URL.
     "src/html_artifact_deploy/uploads.py": 100.0,
+    # which hosts the server downloads from (SSRF boundary)
+    "src/html_artifact_deploy/fetch_client.py": 100.0,
 }
 
 

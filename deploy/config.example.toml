@@ -42,3 +42,12 @@ allowed_domains = ["example.com"]
 allowed_emails = []
 # Optional: the https:// redirect addresses OAuth clients may use (default: claude.ai and claude.com).
 redirect_uri_allowlist = ["https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback"]
+
+# Optional: lets clients publish a page by its https:// address (the publish_page_from_url tool). Remove this whole
+# section to turn the tool off.
+[fetch]
+# Required: the host names pages may be fetched from. Plain names only: no addresses, ports or wildcards, and not
+# this server's own host names.
+allowed_hosts = ["raw.githubusercontent.com"]
+# Optional: seconds to wait for each network operation, 1 to 120 (default 20).
+timeout_seconds = 20

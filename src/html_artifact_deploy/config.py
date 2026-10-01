@@ -7,6 +7,7 @@ It never reads the Google client secret and never touches `pages.root` or `state
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import tomllib
 from collections.abc import Mapping
@@ -39,9 +40,12 @@ _SECTIONS: dict[str, tuple[str, ...]] = {
         "allowed_emails",
         "redirect_uri_allowlist",
     ),
+    "fetch": ("allowed_hosts", "timeout_seconds"),
 }
 _SECRET_ENV_RE = re.compile(r"[A-Z_][A-Z0-9_]*")
 _LOCAL_HOSTS = ("127.0.0.1", "localhost")
+# A dotted DNS name whose last label starts with a letter: wildcards, ports, schemes and IP literals never match.
+HOST_RE = re.compile(r"(?=.{1,253}\Z)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?")
 
 
 class ConfigError(ValueError):
@@ -74,6 +78,12 @@ class AuthConfig:
 
 
 @dataclass(frozen=True)
+class FetchConfig:
+    allowed_hosts: tuple[str, ...]  # lowercased host names
+    timeout_seconds: int = 20
+
+
+@dataclass(frozen=True)
 class Config:
     path: Path
     pages: PagesConfig
@@ -81,6 +91,7 @@ class Config:
     stdio_user: str = "local"
     http: HttpConfig | None = None
     auth: AuthConfig | None = None
+    fetch: FetchConfig | None = None
 
 
 def resolve_config_path(cli_value: str | None, environ: Mapping[str, str]) -> Path:
@@ -121,6 +132,14 @@ def _https_url(value: object) -> str | None:
 
 def _is_int(value: object, low: int, high: int) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
+def _is_ip_address(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _string_list(value: object) -> bool:
@@ -250,6 +269,32 @@ def load_config(path: Path, environ: Mapping[str, str]) -> Config:
             redirect_uri_allowlist=tuple(redirects),
         )
 
+    fetch: FetchConfig | None = None
+    if "fetch" in data:
+        raw = data["fetch"]
+        hosts = raw.get("allowed_hosts")
+        if not isinstance(hosts, list) or not hosts or not all(isinstance(item, str) for item in hosts):
+            raise fail(
+                "fetch.allowed_hosts must list the host names pages may be fetched from, "
+                'for example ["raw.githubusercontent.com"]'
+            )
+        own_hosts = {urlsplit(public_base_url).hostname}
+        if http is not None:
+            own_hosts.add(urlsplit(http.public_url).hostname)
+        for item in hosts:
+            host = item.lower()
+            if _is_ip_address(host) or not HOST_RE.fullmatch(host):
+                raise fail(
+                    f"fetch.allowed_hosts entry {item!r} must be a host name such as raw.githubusercontent.com, "
+                    "not an address, URL or pattern"
+                )
+            if host in own_hosts:
+                raise fail(f"fetch.allowed_hosts must not name this server's own host names ({host})")
+        timeout = raw.get("timeout_seconds", 20)
+        if not _is_int(timeout, 1, 120):
+            raise fail("fetch.timeout_seconds must be a whole number of seconds from 1 to 120")
+        fetch = FetchConfig(allowed_hosts=tuple(item.lower() for item in hosts), timeout_seconds=timeout)
+
     return Config(
         path=path,
         pages=PagesConfig(
@@ -263,6 +308,7 @@ def load_config(path: Path, environ: Mapping[str, str]) -> Config:
         stdio_user=stdio_user,
         http=http,
         auth=auth,
+        fetch=fetch,
     )
 
 

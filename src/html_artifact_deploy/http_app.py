@@ -20,6 +20,7 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 
 from .config import Config, google_client_secret, require_http
+from .fetch_client import FetchClient
 from .google_oidc_client import GoogleOidcClient
 from .oauth_provider import CALLBACK_PATH, START_PATH, GoogleOAuthProvider, auth_settings
 from .page_index import PageIndex
@@ -64,13 +65,14 @@ def build_http_app(
     store.check()
     service = PageService(config.pages, store, PageIndex(db, clock=clock))
     uploads = UploadStore(db, config.state_dir / "uploads", http.public_url, config.pages.max_bytes, clock=clock)
+    fetcher = FetchClient(config.fetch, config.pages.max_bytes) if config.fetch is not None else None
     tokens = TokenStore(db, clock=clock)
     google = google or GoogleOidcClient(auth.google_client_id, google_client_secret(auth, environ))
     provider = GoogleOAuthProvider(auth, http, tokens, google, clock=clock)
     # The SDK's protocol has an optional member, exchange_identity_assertion, that the provider omits; the
     # SDK calls it only when AuthSettings.identity_assertion_enabled is set, and auth_settings leaves it off.
     server = build_server(
-        AppContext(service, _owner, uploads),
+        AppContext(service, _owner, uploads, fetcher),
         auth_server_provider=provider,  # type: ignore[arg-type]
         auth=auth_settings(http),
     )

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from mcp import Client
@@ -17,13 +18,16 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from html_artifact_deploy import __version__
-from html_artifact_deploy.config import PagesConfig
+from html_artifact_deploy.config import FetchConfig, PagesConfig
+from html_artifact_deploy.fetch_client import FetchClient
 from html_artifact_deploy.page_index import PageIndex
 from html_artifact_deploy.server import SERVER_NAME, AppContext, build_server
 from html_artifact_deploy.service import PageService
 from html_artifact_deploy.state import DB_FILE_NAME, StateDB
 from html_artifact_deploy.storage import LocalFolderStore
 from html_artifact_deploy.uploads import UPLOAD_PATH, UploadStore
+
+from .test_fetch_client import FakeHTTPS, ok, public
 
 pytestmark = pytest.mark.unit
 
@@ -42,10 +46,19 @@ class Env:
         self.service = PageService(config, LocalFolderStore(self.root), index)
         self.uploads = UploadStore(StateDB(tmp_path / "state" / "up.sqlite3"), tmp_path / "uploads", BASE, 10_000)
         self.with_uploads = False
+        self.fake: FakeHTTPS | None = None
 
     def server(self, owner: str = ALICE):  # type: ignore[no-untyped-def]
         uploads = self.uploads if self.with_uploads else None
-        return build_server(AppContext(self.service, owner=lambda: owner, uploads=uploads))
+        fetcher = None
+        if self.fake is not None:
+            config = FetchConfig(allowed_hosts=("raw.example.com",))
+            fetcher = FetchClient(config, 10_000, resolve=public, handlers=[self.fake])
+        return build_server(AppContext(self.service, owner=lambda: owner, uploads=uploads, fetcher=fetcher))
+
+    def fetching(self, routes: dict[str, Any]) -> FakeHTTPS:
+        self.fake = FakeHTTPS(routes)
+        return self.fake
 
     async def upload(self, owner: str, body: bytes) -> str:
         """Create a slot for `owner` and PUT `body` to it through the real handler."""
@@ -156,6 +169,82 @@ class TestPublishPage:
         result = await _call(env, "publish_page", args)
         assert result.is_error
         assert _text(result) == f"Error executing tool publish_page: {message}"
+
+
+PAGE_URL = "https://raw.example.com/org/repo/page.html"
+
+
+class TestPublishPageFromUrl:
+    async def test_absent_without_a_fetcher(self, env: Env) -> None:
+        async with Client(env.server()) as client:
+            names = {tool.name for tool in (await client.list_tools()).tools}
+        assert "publish_page_from_url" not in names
+
+    async def test_listed_with_its_annotations(self, env: Env) -> None:
+        env.fetching({})
+        async with Client(env.server()) as client:
+            tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+        assert tools["publish_page_from_url"].annotations == ToolAnnotations(
+            title="Publish HTML page from URL",
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=True,
+        )
+        assert tools["publish_page_from_url"].description
+
+    async def test_publishes_the_downloaded_file(self, env: Env) -> None:
+        fake = env.fetching({PAGE_URL: ok(HTML.encode())})
+        result = await _call(env, "publish_page_from_url", {"title": "Q3", "url": PAGE_URL})
+        assert not result.is_error
+        data = result.structured_content
+        assert data is not None
+        assert data["created"] is True
+        assert data["bytes"] == len(HTML.encode())
+        assert data["url"] == f"{BASE}/{data['page_id']}/"
+        assert (env.root / str(data["page_id"]) / "index.html").read_text(encoding="utf-8") == HTML
+        assert len(fake.requests) == 1
+
+    async def test_page_id_replaces_and_keeps_the_url(self, env: Env) -> None:
+        env.fetching({PAGE_URL: ok(b"<p>v2</p>")})
+        first = (await _call(env, "publish_page", {"title": "v1", "html": HTML})).structured_content
+        assert first is not None
+        second = (
+            await _call(env, "publish_page_from_url", {"title": "v2", "url": PAGE_URL, "page_id": first["page_id"]})
+        ).structured_content
+        assert second is not None
+        assert second["created"] is False
+        assert second["url"] == first["url"]
+        assert (env.root / str(first["page_id"]) / "index.html").read_text() == "<p>v2</p>"
+
+    async def test_bad_title_costs_no_download(self, env: Env) -> None:
+        fake = env.fetching({PAGE_URL: ok()})
+        result = await _call(env, "publish_page_from_url", {"title": "t" * 201, "url": PAGE_URL})
+        assert result.is_error
+        assert _text(result) == "Error executing tool publish_page_from_url: title must be 1 to 200 characters."
+        assert fake.requests == []
+
+    async def test_foreign_page_id_costs_no_download(self, env: Env) -> None:
+        fake = env.fetching({PAGE_URL: ok()})
+        bobs = (await _call(env, "publish_page", {"title": "b", "html": HTML}, owner=BOB)).structured_content
+        assert bobs is not None
+        result = await _call(env, "publish_page_from_url", {"title": "a", "url": PAGE_URL, "page_id": bobs["page_id"]})
+        assert result.is_error
+        assert "was published by you, or it has expired" in _text(result)
+        assert fake.requests == []
+
+    async def test_fetch_error_is_the_tool_error(self, env: Env) -> None:
+        env.fetching({})
+        result = await _call(env, "publish_page_from_url", {"title": "t", "url": "http://raw.example.com/x"})
+        assert result.is_error
+        assert _text(result).startswith("Error executing tool publish_page_from_url: url must be an https:// address")
+
+    async def test_body_that_is_not_utf8(self, env: Env) -> None:
+        env.fetching({PAGE_URL: ok(b"\xff\xfe<p>")})
+        result = await _call(env, "publish_page_from_url", {"title": "t", "url": PAGE_URL})
+        assert result.is_error
+        assert _text(result).startswith("Error executing tool publish_page_from_url: ")
+        assert "UTF-8" in _text(result)
 
 
 class TestUploads:

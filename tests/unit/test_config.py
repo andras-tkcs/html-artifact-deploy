@@ -14,6 +14,7 @@ from html_artifact_deploy.config import (
     AuthConfig,
     Config,
     ConfigError,
+    FetchConfig,
     HttpConfig,
     PagesConfig,
     google_client_secret,
@@ -139,10 +140,27 @@ redirect_uri_allowlist = ["https://app.example.com/cb"]
         config = load(tmp_path, text)
         assert config.pages.public_base_url == "http://localhost:8080"
 
+    def test_fetch_section(self, tmp_path: Path) -> None:
+        config = load(tmp_path, MINIMAL + FETCH)
+        assert config.fetch == FetchConfig(("raw.githubusercontent.com", "files.example.org"), 20)
+        assert load(tmp_path, MINIMAL).fetch is None
+
+    def test_fetch_timeout(self, tmp_path: Path) -> None:
+        config = load(tmp_path, MINIMAL + FETCH + "timeout_seconds = 120\n")
+        assert config.fetch is not None
+        assert config.fetch.timeout_seconds == 120
+
     def test_example_file_loads_with_an_empty_environ(self) -> None:
         config = load_config(EXAMPLE, {})
         assert config.http is not None
         assert config.auth is not None
+        assert config.fetch == FetchConfig(("raw.githubusercontent.com",), 20)
+
+
+FETCH_HOSTS_MSG = (
+    'fetch.allowed_hosts must list the host names pages may be fetched from, for example ["raw.githubusercontent.com"]'
+)
+FETCH = '\n[fetch]\nallowed_hosts = ["Raw.GitHubUserContent.com", "files.example.org"]\n'
 
 
 def _replace(text: str, old: str, new: str) -> str:
@@ -184,7 +202,7 @@ REDIRECT_MSG = "auth.redirect_uri_allowlist must be a list of https:// redirect 
 BAD_FILES: list[tuple[str, str, str]] = [
     ("not-toml", "[pages\n", "not valid TOML: "),
     ("unknown-section", MINIMAL + "[extra]\na = 1\n", "unknown section [extra]"),
-    ("fetch-is-unknown-until-p8", MINIMAL + '[fetch]\nallowed_hosts = ["a.example.com"]\n', "unknown section [fetch]"),
+    ("unknown-fetch-key", MINIMAL + '[fetch]\nallowed_host = ["a.example.com"]\n', "unknown key fetch.allowed_host"),
     ("section-not-a-table", "stdio = 3\n" + MINIMAL, "[stdio] must be a table"),
     ("unknown-pages-key", _replace(MINIMAL, ROOT, ROOT + "\nrot = 1"), "unknown key pages.rot"),
     ("unknown-auth-key", _replace(FULL, DOMAINS, DOMAINS + "\nallowed_domain = []"), "unknown key auth.allowed_domain"),
@@ -334,6 +352,48 @@ BAD_FILES: list[tuple[str, str, str]] = [
         REDIRECT_MSG,
     ),
     ("redirect-unparseable", _replace(FULL, EMAILS, EMAILS + '\nredirect_uri_allowlist = ["https://["]'), REDIRECT_MSG),
+]
+
+BAD_FILES += [
+    ("fetch-hosts-missing", MINIMAL + AUTH.split("[auth]")[0] + "\n[fetch]\ntimeout_seconds = 5\n", FETCH_HOSTS_MSG),
+    ("fetch-hosts-empty", MINIMAL + "\n[fetch]\nallowed_hosts = []\n", FETCH_HOSTS_MSG),
+    ("fetch-hosts-string", MINIMAL + '\n[fetch]\nallowed_hosts = "a.example.com"\n', FETCH_HOSTS_MSG),
+    ("fetch-hosts-number", MINIMAL + "\n[fetch]\nallowed_hosts = [1]\n", FETCH_HOSTS_MSG),
+    *[
+        (
+            f"fetch-host-{name}",
+            MINIMAL + f'\n[fetch]\nallowed_hosts = ["{value}"]\n',
+            f"fetch.allowed_hosts entry {value!r} must be a host name such as raw.githubusercontent.com, "
+            "not an address, URL or pattern",
+        )
+        for name, value in [
+            ("ipv4", "10.0.0.5"),
+            ("ipv6", "::1"),
+            ("url", "https://a.example.com"),
+            ("wildcard", "*.example.com"),
+            ("port", "a.example.com:443"),
+            ("single-label", "localhost"),
+            ("digit-tld", "a.123"),
+        ]
+    ],
+    (
+        "fetch-pages-host",
+        MINIMAL + '\n[fetch]\nallowed_hosts = ["Pages.Example.com"]\n',
+        "fetch.allowed_hosts must not name this server's own host names (pages.example.com)",
+    ),
+    (
+        "fetch-http-host",
+        MINIMAL + AUTH.split("[auth]")[0] + '\n[fetch]\nallowed_hosts = ["publish.example.com"]\n',
+        "fetch.allowed_hosts must not name this server's own host names (publish.example.com)",
+    ),
+    *[
+        (
+            f"fetch-timeout-{name}",
+            MINIMAL + f'\n[fetch]\nallowed_hosts = ["a.example.org"]\ntimeout_seconds = {value}\n',
+            "fetch.timeout_seconds must be a whole number of seconds from 1 to 120",
+        )
+        for name, value in [("zero", "0"), ("big", "121"), ("bool", "true"), ("string", '"5"')]
+    ],
 ]
 
 
