@@ -89,7 +89,15 @@ ignore_missing_imports = true
 # The strictness ratchet: scripts/mypy_strict_modules.py re-runs mypy, blocking, over every module
 # listed in an override like this one. Promote a module by adding a block once it is clean.
 [[tool.mypy.overrides]]
-module = "html_artifact_deploy.server"
+module = [
+    "html_artifact_deploy.server",
+    "html_artifact_deploy.config",
+    "html_artifact_deploy.pages",
+    "html_artifact_deploy.storage",
+    "html_artifact_deploy.state",
+    "html_artifact_deploy.page_index",
+    "html_artifact_deploy.service",
+]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 disallow_untyped_calls = true

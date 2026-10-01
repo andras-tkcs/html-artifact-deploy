@@ -13,7 +13,7 @@ pip install html-artifact-deploy
 **Claude Code**
 
 ```bash
-claude mcp add html-artifact-deploy -- html-artifact-deploy
+claude mcp add html-artifact-deploy -- html-artifact-deploy --config ~/html-artifact-deploy.toml
 ```
 
 **Claude Desktop** (`claude_desktop_config.json`)
@@ -21,7 +21,7 @@ claude mcp add html-artifact-deploy -- html-artifact-deploy
 ```json
 {
   "mcpServers": {
-    "html-artifact-deploy": { "command": "html-artifact-deploy" }
+    "html-artifact-deploy": { "command": "html-artifact-deploy", "args": ["--config", "~/html-artifact-deploy.toml"] }
   }
 }
 ```
@@ -30,7 +30,9 @@ claude mcp add html-artifact-deploy -- html-artifact-deploy
 
 | Tool | What it does |
 |---|---|
-| `echo` | Returns its input (a placeholder; replace with the real tools) |
+| `publish_page` | Publishes a single-file HTML page and returns its link |
+| `list_pages` | Lists the pages you published, newest first |
+| `unpublish_page` | Takes one of your pages down |
 | `server_info` | Reports the server's name and version |
 
 ## Documentation

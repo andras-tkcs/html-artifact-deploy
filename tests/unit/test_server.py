@@ -6,44 +6,201 @@ tests/integration/test_stdio_contract.py's job.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from pathlib import Path
+
 import pytest
 from mcp import Client
+from mcp.types import CallToolResult, ToolAnnotations
 
 from html_artifact_deploy import __version__
-from html_artifact_deploy.server import SERVER_NAME, build_server
+from html_artifact_deploy.config import PagesConfig
+from html_artifact_deploy.page_index import PageIndex
+from html_artifact_deploy.server import SERVER_NAME, AppContext, build_server
+from html_artifact_deploy.service import PageService
+from html_artifact_deploy.state import DB_FILE_NAME, StateDB
+from html_artifact_deploy.storage import LocalFolderStore
 
 pytestmark = pytest.mark.unit
 
+BASE = "https://pages.example.com"
+ALICE = "alice@example.com"
+BOB = "bob@example.com"
+HTML = "<!doctype html><title>Q3</title><p>héllo</p>"
+
+
+class Env:
+    def __init__(self, tmp_path: Path) -> None:
+        self.root = tmp_path / "pages"
+        self.root.mkdir()
+        config = PagesConfig(root=self.root, public_base_url=BASE)
+        index = PageIndex(StateDB(tmp_path / "state" / DB_FILE_NAME))
+        self.service = PageService(config, LocalFolderStore(self.root), index)
+
+    def server(self, owner: str = ALICE):  # type: ignore[no-untyped-def]
+        return build_server(AppContext(self.service, owner=lambda: owner))
+
+
+@pytest.fixture
+def env(tmp_path: Path) -> Env:
+    return Env(tmp_path)
+
+
+async def _call(env: Env, tool: str, args: dict[str, object], owner: str = ALICE) -> CallToolResult:
+    async with Client(env.server(owner)) as client:
+        return await client.call_tool(tool, args)
+
+
+def _text(result: CallToolResult) -> str:
+    return "".join(getattr(block, "text", "") for block in result.content)
+
 
 class TestToolList:
-    async def test_lists_every_tool(self) -> None:
-        async with Client(build_server()) as client:
+    async def test_lists_every_tool(self, env: Env) -> None:
+        async with Client(env.server()) as client:
             names = {tool.name for tool in (await client.list_tools()).tools}
-        assert names == {"echo", "server_info"}
+        assert names == {"publish_page", "list_pages", "unpublish_page", "server_info"}
 
-    async def test_every_tool_has_a_description(self) -> None:
-        async with Client(build_server()) as client:
+    async def test_every_tool_has_a_description(self, env: Env) -> None:
+        async with Client(env.server()) as client:
             tools = (await client.list_tools()).tools
         assert all(tool.description and tool.description.strip() for tool in tools)
 
+    async def test_annotations(self, env: Env) -> None:
+        async with Client(env.server()) as client:
+            tools = {tool.name: tool.annotations for tool in (await client.list_tools()).tools}
+        assert tools["publish_page"] == ToolAnnotations(
+            title="Publish HTML page",
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=True,
+        )
+        assert tools["list_pages"] == ToolAnnotations(
+            title="List my HTML pages",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        )
+        assert tools["unpublish_page"] == ToolAnnotations(
+            title="Take down HTML page",
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=True,
+        )
 
-class TestEcho:
-    @pytest.mark.parametrize("text", ["hello", "", "ünïcödé"])
-    async def test_returns_its_input(self, text: str) -> None:
-        async with Client(build_server()) as client:
-            result = await client.call_tool("echo", {"text": text})
+
+class TestPublishPage:
+    async def test_publishes_a_new_page(self, env: Env) -> None:
+        result = await _call(env, "publish_page", {"title": "Secret Q3 title", "html": HTML})
         assert not result.is_error
-        assert result.structured_content == {"result": text}
+        data = result.structured_content
+        assert data is not None
+        page_id = data["page_id"]
+        assert data["url"] == f"https://pages.example.com/{page_id}/"
+        assert "Secret" not in str(data["url"])
+        assert data["title"] == "Secret Q3 title"
+        assert data["bytes"] == len(HTML.encode())
+        assert data["created"] is True
+        assert str(data["updated_at"]).endswith("+00:00")
+        assert str(data["expires_at"]).endswith("+00:00")
+        assert (env.root / str(page_id) / "index.html").read_text(encoding="utf-8") == HTML
+
+    async def test_replaces_a_page_at_the_same_url(self, env: Env) -> None:
+        first = (await _call(env, "publish_page", {"title": "v1", "html": HTML})).structured_content
+        assert first is not None
+        second = (
+            await _call(env, "publish_page", {"title": "v2", "html": "<p>v2</p>", "page_id": first["page_id"]})
+        ).structured_content
+        assert second is not None
+        assert second["created"] is False
+        assert second["url"] == first["url"]
+        assert second["expires_at"] == first["expires_at"]
+        assert (env.root / str(first["page_id"]) / "index.html").read_text() == "<p>v2</p>"
+
+    @pytest.mark.parametrize(
+        ("args", "message"),
+        [
+            ({"title": "t", "html": HTML, "upload_id": "u"}, "Give exactly one of html and upload_id."),
+            ({"title": "t"}, "Give exactly one of html and upload_id."),
+            (
+                {"title": "t", "upload_id": "u"},
+                "Uploads are not available on this connection; pass the page as html.",
+            ),
+            (
+                {"title": "t", "html": HTML, "page_id": "a" * 32},
+                f"No page with page_id {'a' * 32!r} was published by you, or it has expired. "
+                "Call list_pages to see your pages.",
+            ),
+            ({"title": "t" * 201, "html": HTML}, "title must be 1 to 200 characters."),
+        ],
+    )
+    async def test_errors(self, env: Env, args: dict[str, object], message: str) -> None:
+        result = await _call(env, "publish_page", args)
+        assert result.is_error
+        assert _text(result) == f"Error executing tool publish_page: {message}"
+
+
+class TestListPages:
+    async def test_lists_own_pages(self, env: Env) -> None:
+        published = (await _call(env, "publish_page", {"title": "One", "html": HTML})).structured_content
+        assert published is not None
+        result = await _call(env, "list_pages", {})
+        data = result.structured_content
+        assert data is not None
+        assert data["count"] == 1
+        (page,) = data["pages"]  # type: ignore[misc]
+        assert page["page_id"] == published["page_id"]
+        assert page["title"] == "One"
+        assert page["url"] == published["url"]
+        assert set(page) == {"page_id", "title", "url", "bytes", "created_at", "updated_at", "expires_at"}
+
+    async def test_empty(self, env: Env) -> None:
+        data = (await _call(env, "list_pages", {"limit": 5})).structured_content
+        assert data == {"pages": [], "count": 0}
+
+
+class TestUnpublishPage:
+    async def test_removes_the_page(self, env: Env) -> None:
+        published = (await _call(env, "publish_page", {"title": "One", "html": HTML})).structured_content
+        assert published is not None
+        result = await _call(env, "unpublish_page", {"page_id": published["page_id"]})
+        assert result.structured_content == {"page_id": published["page_id"], "url": published["url"], "removed": True}
+        assert not (env.root / str(published["page_id"])).exists()
+
+    async def test_unknown_page(self, env: Env) -> None:
+        result = await _call(env, "unpublish_page", {"page_id": "b" * 32})
+        assert result.is_error
+        assert _text(result) == (
+            f"Error executing tool unpublish_page: No page with page_id {'b' * 32!r} was published by you, or it has expired. "
+            "Call list_pages to see your pages."
+        )
+
+
+class TestOwnership:
+    async def test_a_second_owner_cannot_see_or_remove_a_page(self, env: Env) -> None:
+        published = (await _call(env, "publish_page", {"title": "Mine", "html": HTML})).structured_content
+        assert published is not None
+        page_id = published["page_id"]
+        listed = (await _call(env, "list_pages", {}, owner=BOB)).structured_content
+        assert listed == {"pages": [], "count": 0}
+        removed = await _call(env, "unpublish_page", {"page_id": page_id}, owner=BOB)
+        assert removed.is_error
+        replaced = await _call(env, "publish_page", {"title": "x", "html": HTML, "page_id": page_id}, owner=BOB)
+        assert replaced.is_error
+        assert (env.root / str(page_id) / "index.html").exists()
 
 
 class TestServerInfo:
-    async def test_reports_name_and_installed_version(self) -> None:
-        async with Client(build_server()) as client:
-            result = await client.call_tool("server_info", {})
+    async def test_reports_name_and_installed_version(self, env: Env) -> None:
+        result = await _call(env, "server_info", {})
         assert result.structured_content == {"name": SERVER_NAME, "version": __version__}
 
 
 class TestFreshInstances:
-    def test_each_call_builds_a_new_server(self) -> None:
+    def test_each_call_builds_a_new_server(self, env: Env) -> None:
         """Tests must never share a server through module state; see server.py's docstring."""
-        assert build_server() is not build_server()
+        build: Callable[[], object] = env.server
+        assert build() is not build()

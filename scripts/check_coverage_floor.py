@@ -33,6 +33,10 @@ OVERALL_FLOOR = 100.0
 MODULE_FLOORS: dict[str, float] = {
     # The tool surface every MCP client sees.
     "src/html_artifact_deploy/server.py": 100.0,
+    # The configuration's fail-closed checks.
+    "src/html_artifact_deploy/config.py": 100.0,
+    # Writes into the published folder.
+    "src/html_artifact_deploy/storage.py": 100.0,
 }
 
 
