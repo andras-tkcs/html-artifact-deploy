@@ -28,6 +28,7 @@ from mcp.server.auth.provider import (
     AuthorizationCode,
     AuthorizationParams,
     AuthorizeError,
+    IdentityAssertionParams,
     RefreshToken,
     RegistrationError,
     TokenError,
@@ -294,6 +295,13 @@ class GoogleOAuthProvider:
             resource=row["resource"],
             subject=row["subject"],
         )
+
+    async def exchange_identity_assertion(
+        self,
+        client: OAuthClientInformationFull,
+        params: IdentityAssertionParams,
+    ) -> OAuthToken:
+        raise TokenError("unsupported_grant_type", "Identity assertions are not supported.")
 
     async def exchange_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: RefreshToken, scopes: list[str]
