@@ -8,7 +8,8 @@ server the organization runs and answers with the page's link. Anyone with the l
 page. The person who published a page can replace it at the same link, list their pages and take
 one down. People sign in with their Google Workspace account. claude.ai and Claude Desktop connect
 through OAuth; Claude Code connects through OAuth or a personal API token. Large pages go through
-a one-time upload URL instead of a tool argument.
+a one-time upload URL instead of a tool argument, or, when the page is already online on a host
+the administrator allows, the server downloads it from its https address.
 
 The feature began as a PrivacyFence connector plan (PrivacyFence repository, branch
 `plan/web-pages`), and was moved out because publishing is a service of its own rather than a
@@ -89,6 +90,7 @@ One Python package, one process per deployment, two transports built from one fa
 | `token_store.py` | `TokenStore`: OAuth clients, pending sign-ins, codes, tokens, API tokens (D10) |
 | `oauth_provider.py` | `GoogleOAuthProvider`: the OAuth 2.1 authorization server (D10) |
 | `uploads.py` | `UploadStore`, `UploadError`: one-time upload URLs (D12) |
+| `fetch_client.py` | `FetchClient`, `FetchClientError`: download a page from an allowlisted https host (D16) |
 | `http_app.py` | `build_http_app()`: Streamable HTTP, OAuth routes, upload route, health check (D11) |
 | `__main__.py` | The command line: stdio (default), `serve-http`, `check-config`, `token …` (D13) |
 
@@ -99,12 +101,13 @@ Every new module must pass `mypy --strict` from its first commit (each phase's a
 it on its own files). Promotion into the blocking ratchet happens by name in sequential phases,
 turning the existing block's `module = "html_artifact_deploy.server"` into a list:
 p3 adds `config`, `pages`, `storage`, `state`, `page_index`, `service`; p6 adds
-`google_oidc_client`, `token_store`, `oauth_provider`, `http_app`, `__main__`; p7 adds `uploads`.
+`google_oidc_client`, `token_store`, `oauth_provider`, `http_app`, `__main__`; p7 adds `uploads`;
+p8 adds `fetch_client`.
 Coverage floors at 100 (`MODULE_FLOORS` in `scripts/check_coverage_floor.py`, with a one-line
 comment each) are added in the same phases for `config.py`, `storage.py` (p3), `token_store.py`,
-`oauth_provider.py`, `http_app.py` (p6) and `uploads.py` (p7).
+`oauth_provider.py`, `http_app.py` (p6), `uploads.py` (p7) and `fetch_client.py` (p8).
 
-`CHANGELOG.md` is written only by p9; no other phase edits it.
+`CHANGELOG.md` is written only by p10; no other phase edits it.
 
 Blocking work (SQLite, file I/O, the Google HTTP call) is synchronous inside its module and called
 from `async def` code through `asyncio.to_thread(...)` (coding guidelines, "Async and
@@ -142,7 +145,14 @@ google_client_secret_env = "HTML_ARTIFACT_DEPLOY_GOOGLE_CLIENT_SECRET"   # optio
 allowed_domains = ["example.com"]
 allowed_emails = []
 redirect_uri_allowlist = ["https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback"]  # optional
+
+[fetch]                                        # optional; turns on publish_page_from_url (D16)
+allowed_hosts = ["raw.githubusercontent.com"]
+timeout_seconds = 20                           # optional
 ```
+
+The `[fetch]` section, `FetchConfig` and its rows in the table below are added by p8; until then
+`[fetch]` is an unknown section like any other.
 
 Dataclasses, all `@dataclass(frozen=True)`:
 
@@ -164,9 +174,9 @@ class HttpConfig:
 @dataclass(frozen=True)
 class AuthConfig:
     google_client_id: str
-    google_client_secret_env: str = DEFAULT_SECRET_ENV   # the NAME of the variable holding the secret
     allowed_domains: tuple[str, ...]
     allowed_emails: tuple[str, ...]
+    google_client_secret_env: str = DEFAULT_SECRET_ENV   # the NAME of the variable holding the secret
     redirect_uri_allowlist: tuple[str, ...] = DEFAULT_REDIRECT_URI_ALLOWLIST
 
 @dataclass(frozen=True)
@@ -177,6 +187,12 @@ class Config:
     stdio_user: str = "local"
     http: HttpConfig | None = None
     auth: AuthConfig | None = None
+    fetch: FetchConfig | None = None                     # added by p8
+
+@dataclass(frozen=True)
+class FetchConfig:                                       # added by p8
+    allowed_hosts: tuple[str, ...]                       # lowercased host names
+    timeout_seconds: int = 20
 
 DEFAULT_MAX_BYTES = 16_000_000      # the size limit of a claude.ai artifact
 MAX_MAX_BYTES = 50_000_000
@@ -199,7 +215,7 @@ trailing `/` is stripped. Allowed-email and domain values are lowercased on load
 |---|---|
 | file missing | `No configuration file here. Pass --config, or set HTML_ARTIFACT_DEPLOY_CONFIG.` |
 | not valid TOML (`tomllib.TOMLDecodeError`) | `not valid TOML: {exc}` |
-| a top-level key other than `pages`, `state`, `stdio`, `http`, `auth` | `unknown section [{name}]` |
+| a top-level key other than `pages`, `state`, `stdio`, `http`, `auth` (and, from p8, `fetch`) | `unknown section [{name}]` |
 | a key inside a section not listed above | `unknown key {section}.{key}` |
 | `pages` missing | `the [pages] section is required` |
 | `pages.root` not a non-empty string naming an absolute path | `pages.root must be the absolute path of the folder the web server publishes, for example /srv/pages` |
@@ -217,6 +233,10 @@ trailing `/` is stripped. Allowed-email and domain values are lowercased on load
 | both lists empty | `auth.allowed_domains or auth.allowed_emails must name who may sign in` |
 | an `allowed_emails` entry without exactly one `@` | `auth.allowed_emails entry {value!r} is not an e-mail address` |
 | `auth.redirect_uri_allowlist` present and not a list of `https://` URLs (plain `urlsplit` scheme check) | `auth.redirect_uri_allowlist must be a list of https:// redirect URIs` |
+| (p8) `fetch.allowed_hosts` missing, empty, or not a list of strings | `fetch.allowed_hosts must list the host names pages may be fetched from, for example ["raw.githubusercontent.com"]` |
+| (p8) an entry, lowercased, that `ipaddress.ip_address` accepts, or that does not match `HOST_RE` | `fetch.allowed_hosts entry {value!r} must be a host name such as raw.githubusercontent.com, not an address, URL or pattern` |
+| (p8) an entry equal to the host name of `http.public_url` or of `pages.public_base_url` | `fetch.allowed_hosts must not name this server's own host names ({value})` |
+| (p8) `fetch.timeout_seconds` present and not an `int` in 1…120 | `fetch.timeout_seconds must be a whole number of seconds from 1 to 120` |
 
 The secret itself is not read by `load_config`, so stdio, `check-config` without the
 variable, and the `token` commands work without it. `google_client_secret(auth, environ)` returns
@@ -228,6 +248,10 @@ it when `[auth]` is present.
 Unknown keys are errors, not ignored: a typo in a security setting must not be silently
 dropped. `load_config` never touches `pages.root` or `state.dir` on disk; `LocalFolderStore` and
 `StateDB` check those when built.
+
+`HOST_RE = re.compile(r"(?=.{1,253}\Z)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?")`,
+used only as `HOST_RE.fullmatch(value)` (added by p8): a dotted DNS name whose last label starts with a letter. Wildcards, ports, schemes
+and IP literals are refused, so every allowed host is a name an administrator wrote out.
 
 `require_http(config)` returns `(config.http, config.auth)`, or raises
 `ConfigError(f"{config.path}: serve-http needs the [http] and [auth] sections")` if either is
@@ -431,6 +455,7 @@ class AppContext:
     service: PageService
     owner: Callable[[], str]          # who is calling; raises ToolError("Not signed in.") if unknown
     uploads: UploadStore | None = None   # None over stdio; the field is added by p7
+    fetcher: FetchClient | None = None   # None without [fetch]; the field is added by p8
 
 def build_server(
     app: AppContext,
@@ -440,8 +465,8 @@ def build_server(
 ) -> MCPServer: ...
 ```
 
-`echo` is removed. `server_info` stays as it is. Every tool catches `PageError` (and in p7
-`UploadError`) and raises `ToolError(str(exc))`; nothing else is caught (the SDK turns other
+`echo` is removed. `server_info` stays as it is. Every tool catches `PageError` (and from p7
+`UploadError`, from p8 `FetchClientError`) and raises `ToolError(str(exc))`; nothing else is caught (the SDK turns other
 exceptions into a generic error and logs the traceback).
 
 Tools, with their exact descriptions (the function docstring is the description; `Args:` documents
@@ -474,6 +499,9 @@ With `upload_id` (p7): `await service.check_can_publish(owner, title, page_id)`,
 `data = await uploads.read(owner, upload_id)`, then `service.publish(...)`, then
 `await uploads.discard(upload_id)`.
 Result: `{"page_id", "url", "title", "bytes", "created", "updated_at"}` (ISO string).
+
+p8 inserts one sentence after "pass upload_id instead.": `If the page is already online,
+publish_page_from_url (when available) fetches it from its address instead.`
 
 **`list_pages(limit: int = 50) -> dict[str, object]`**
 annotations `ToolAnnotations(title="List my HTML pages", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)`
@@ -858,7 +886,7 @@ pages.example.com {
 `file_server` without `browse` lists no directories, so the random folder name keeps other
 pages from being found.
 
-`docs/deployment.md` (p8), in order: 1. DNS; 2. Google OAuth client (Google Auth Platform: Branding, then Audience
+`docs/deployment.md` (p9), in order: 1. DNS; 2. Google OAuth client (Google Auth Platform: Branding, then Audience
 set to **Internal**, then Clients → Create client → **Web application**, authorized redirect URI `https://publish.example.com/oauth/google/callback`);
 3. `sudo apt install caddy` (Caddy's apt repository), `sudo useradd --system --home-dir /var/lib/html-artifact-deploy --shell /usr/sbin/nologin html-artifact-deploy`,
 `sudo install -d -o html-artifact-deploy -g html-artifact-deploy -m 755 /srv/pages`;
@@ -874,10 +902,10 @@ It notes: the sandbox header gives every page an opaque origin, so `localStorage
 don't persist, and claude.ai-only artifact features (shared storage, asking Claude) do not work
 once a page is published elsewhere.
 
-`docs/configuration.md` (p8): every key of D2 with its type, default and meaning, and the D13
+`docs/configuration.md` (p9): every key of D2 with its type, default and meaning, and the D13
 commands.
 
-### D15. Connecting clients (README, p8)
+### D15. Connecting clients (README, p9)
 
 - **claude.ai and Claude Desktop**: Settings → Connectors → Add custom connector, URL
   `https://publish.example.com/mcp`; sign in with Google when asked.
@@ -888,6 +916,112 @@ commands.
 - **Local, stdio** (development and trying it out, with a config whose `pages.root` and
   `state.dir` are folders you own): `claude mcp add html-artifact-deploy -- html-artifact-deploy --config ~/html-artifact-deploy.toml`.
   Not for a server deployment, whose folders belong to the service user.
+
+### D16. Publishing from an https address: `fetch_client.py`, `publish_page_from_url`
+
+For a page that already lives somewhere Claude cannot copy it from cheaply (a Git host's raw file,
+a presigned object-storage URL, an intranet file server reachable from this machine), the server
+downloads it itself. Off by default: without a `[fetch]` section the tool is not registered. Hosts
+are an explicit list of names written by the administrator (D2), because a server that fetches any
+URL a model hands it can be steered at internal services (server-side request forgery).
+
+```python
+USER_AGENT = f"html-artifact-deploy/{__version__}"
+MAX_REDIRECTS = 3
+CHUNK = 65_536
+
+class FetchClientError(Exception): ...          # message goes to the caller verbatim
+
+class FetchClient:
+    def __init__(self, config: FetchConfig, max_bytes: int, *,
+                 resolve: Callable[..., list[tuple[Any, ...]]] = socket.getaddrinfo,
+                 handlers: Sequence[urllib.request.BaseHandler] = ()) -> None: ...
+    async def fetch(self, url: str) -> bytes: ...          # asyncio.to_thread(self._fetch_blocking, url)
+    def check_url(self, url: str) -> str: ...              # returns the lowercased host, or raises
+    def _fetch_blocking(self, url: str) -> bytes: ...
+```
+
+The opener is `urllib.request.build_opener(urllib.request.ProxyHandler({}), _AllowlistRedirectHandler(self), *handlers)`.
+`ProxyHandler({})` turns off proxies from `HTTPS_PROXY` and friends: a proxy would resolve the
+name itself (making the address check meaningless) and could add proxy credentials. A deployment
+that can reach the internet only through a proxy cannot use this tool; ADR 0020 accepts that.
+`handlers` exists for tests: a test passes a `urllib.request.HTTPSHandler` subclass whose
+`https_open` builds `resp = urllib.response.addinfourl(io.BytesIO(body), headers, req.full_url, code)`
+(`headers` an `email.message.Message`), sets `resp.msg = "OK"` (urllib's `HTTPErrorProcessor`
+reads it) and returns it; `build_opener` replaces the default HTTPS handler with it. No cookie
+processor or `Authorization` header is ever added.
+
+`check_url(url)`, checks in this order (each raises `FetchClientError` with this message):
+
+| Check | Message |
+|---|---|
+| any character with code ≤ 0x20 or 0x7F in `url`; `urlsplit(url)` or its `.port` raising `ValueError`; scheme not `https`; no hostname; `username is not None or password is not None`; port not `None` or `443` | `url must be an https:// address with no user name, password or port, for example https://raw.githubusercontent.com/org/repo/main/page.html.` |
+| host (lowercased) not in `config.allowed_hosts` | `This server only fetches pages from {', '.join(allowed_hosts)}. Ask whoever runs it to add {host} to fetch.allowed_hosts, or pass the page as html.` |
+| `resolve(host, 443, type=socket.SOCK_STREAM)` raises `OSError` | `Could not look up {host}.` |
+| any resolved address (`info[4][0]` of each `getaddrinfo` tuple, a `%scope` suffix removed) for which `not ipaddress.ip_address(addr).is_global`, or that lies in `64:ff9b::/96` or `64:ff9b:1::/48` (NAT64, which maps to IPv4 addresses `is_global` cannot see) | `{host} resolves to a private or local address, so this server will not fetch from it.` |
+
+The address check guards against an allowed name whose DNS points inside the network; the
+connection resolves the name again, and that window is accepted because only administrator-listed
+names reach it (ADR 0020).
+
+`_fetch_blocking(url)`:
+1. `host = check_url(url)`.
+2. `urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT, "Accept": "text/html, */*;q=0.1"})`;
+   `opener.open(request, timeout=config.timeout_seconds)` (bandit does not flag `opener.open`, so no
+   `nosec`). The `Request` gets `url` unchanged: `check_url` has already refused control characters,
+   so urllib and `urlsplit` see the same address.
+3. `_AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler)` overrides
+   `redirect_request(self, req, fp, code, msg, headers, newurl)`:
+   `len(getattr(req, "redirect_dict", {})) >= MAX_REDIRECTS` →
+   `FetchClientError("The address redirected too many times.")`; then `client.check_url(newurl)`,
+   whose `FetchClientError` is re-raised as
+   `FetchClientError(f"The address redirected to {urlsplit(newurl).hostname or 'an invalid address'}, which this server does not fetch from.")`;
+   otherwise return `super().redirect_request(...)`. (urllib calls `redirect_request` before its own
+   loop check and keeps `redirect_dict` on the request; it counts distinct URLs, so a loop A→B→A is
+   stopped by urllib's own `max_repeats` as an `HTTPError` with the 3xx code, which step 4 reports
+   as "answered HTTP 302.". urllib also refuses a `file:` or `data:` Location before calling
+   `redirect_request`, the same way.)
+4. `urllib.error.HTTPError` (any non-2xx after redirects) → close it (`exc.close()`), then
+   `FetchClientError(f"{host} answered HTTP {code}.")`; `OSError` (covers `URLError`, `TimeoutError`,
+   TLS errors) or `ValueError` (urllib's own parse of a malformed `Location`) →
+   `FetchClientError(f"Could not fetch the page from {host}.")`.
+   `FetchClientError` raised inside the handler passes through unchanged.
+5. A `Content-Length` header that is all digits (`str.isdigit()`) and over `max_bytes` → `FetchClientError(f"The page at that address is over the {max_bytes:,}-byte limit.")`
+   before reading; otherwise read `CHUNK`-sized pieces and stop with the same error as soon as more
+   than `max_bytes` have arrived. A `Content-Length` that is not all digits is ignored (the
+   streaming limit still applies). The response is closed in a `finally`.
+6. `logger.info("fetched %d bytes from %s", len(data), host)`. The URL's path and query are never
+   logged or put in an error message (a presigned URL's query is a credential).
+
+Tool, registered by `build_server` only when `app.fetcher is not None`:
+
+**`publish_page_from_url(title: str, url: str, page_id: str = "") -> dict[str, object]`**
+annotations `ToolAnnotations(title="Publish HTML page from URL", readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True)`
+
+> Publish a single-file HTML page that is already online, by its https address, and return its link.
+>
+> The server downloads the file itself, so the page does not have to pass through this
+> conversation; use it for large pages. The address must be on a host this server allows (an error
+> names them) and must return the file to a plain GET with no sign-in, for example a raw file on a
+> Git host or a presigned storage link. Returns page_id, url, title, bytes, created and updated_at,
+> as publish_page does. To change a page you published, pass its page_id; the page is replaced and
+> keeps its url. For a page you have as text, use publish_page.
+>
+> Args:
+>     title: What the page is, in words, for example "Q3 report". 1 to 200 characters. It also
+>         names the file in the link; a replacement keeps the original link.
+>     url: The https address of the HTML file.
+>     page_id: The page_id of a page you published, to replace it. Empty to publish a new page.
+
+Flow: `await service.check_can_publish(owner, title, page_id)` (so a bad title or a foreign page_id
+costs no download), `data = await fetcher.fetch(url)`, `service.publish(owner, title, data, page_id)`
+(its size and UTF-8 checks apply to the downloaded bytes too); `FetchClientError` and `PageError`
+→ `ToolError(str(exc))`.
+
+`__main__` (stdio) and `build_http_app` build `FetchClient(config.fetch, config.pages.max_bytes)`
+when `config.fetch` is set and pass it as `AppContext.fetcher`. The limits are therefore the same
+on every path: `pages.max_bytes` (16 MB by default) for the page, `fetch.timeout_seconds` per
+network operation.
 
 ### Rejected alternatives (the ADRs' "Alternatives considered")
 
@@ -919,6 +1053,14 @@ commands.
 - **JWT access tokens**: cannot be revoked without a deny list; opaque tokens in SQLite can.
 - **JSON files for state**: several concurrent writers (sign-ins, publishes, uploads) need
   transactions; SQLite is in the standard library.
+- **Fetching any URL** for `publish_page_from_url`: a model-supplied address could point at
+  cloud metadata endpoints or internal services. An administrator-written host list, https only,
+  redirects re-checked against it, and resolved addresses required to be public.
+- **Fetching through `httpx2`**: it comes with `mcp` but is not a declared dependency and its
+  name may change with the SDK; `urllib` is standard library and its redirect handler is the one
+  hook needed.
+- **Fetching claude.ai artifacts by link**: an artifact's link serves a viewer page and is private
+  by default, so there is no raw file to fetch.
 - **Stateful Streamable HTTP sessions**: lost on restart, and a long-lived stream behind a reverse
   proxy for no benefit; the tools need no server-to-client messages.
 
@@ -943,6 +1085,10 @@ commands.
 - **0018** — Large pages arrive through one-time capability upload URLs, not a tool argument.
 - **0019** — Streamable HTTP runs stateless with JSON responses, and `starlette` and `uvicorn`
   are declared runtime dependencies (already installed by `mcp`).
+- **0020** — The server downloads a page by URL only from administrator-listed https hosts,
+  directly (never through a proxy), re-checking every redirect and refusing non-public addresses;
+  off unless `[fetch]` is configured. Accepted: the DNS re-resolution window, and that a
+  proxy-only network cannot use it.
 
 ## Manual steps
 
@@ -955,7 +1101,8 @@ After implementation (`manual_after`), on real infrastructure, following the ste
 - **ma1** — Create the Google OAuth client, set up an Ubuntu 24.04 server with Caddy and two DNS
   names, deploy the feature branch, and check the pages host's headers.
 - **ma2** — claude.ai (and Claude Desktop through the same connector): sign in, publish, replace,
-  list, take down; a second, non-allowed Google account is refused.
+  list, take down, publish from an allowed URL and be refused for another host; a second,
+  non-allowed Google account is refused.
 - **ma3** — Claude Code: OAuth sign-in, an API token, and a large page through
   `create_page_upload`.
 
@@ -986,6 +1133,10 @@ After implementation (`manual_after`), on real infrastructure, following the ste
   stdio integration test and the packaged test must write a temporary config and pass
   `--config`; the packaged test runs inside `build.yml`, so p3 must dispatch `build.yml` against its
   phase branch (steward table) and report the run.
+- **urllib redirect behaviour** (p8). The design relies on `HTTPRedirectHandler.redirect_request`
+  being called for every 301/302/303/307/308 hop, with `len(req.redirect_dict)` equal to the
+  hops so far; a p8 test asserts the counts 0, 1, 2 for three hops on the installed Python. If the installed Python's `urllib.request` differs, the worker stops with
+  `status=blocked` and quotes it. No live check is added for fetching: there is no fixed upstream.
 - **Google fixture recording** needs outbound HTTPS to `accounts.google.com`, which this container
   has. If a worker's container does not, it runs `/qa-record google_openid_configuration`
   (dispatches `qa-record-fixture.yml`); if that queues for more than 30 minutes (no runner online),
@@ -1005,7 +1156,7 @@ manual_after:
     title: Create the Google OAuth client and deploy the feature branch on an Ubuntu 24.04 server with Caddy
     why: Real DNS, TLS, Google Workspace sign-in, systemd and Caddy headers cannot run in CI
   - id: ma2-claude-ai
-    title: From claude.ai (and Claude Desktop), sign in, publish, replace, list and take down a page; a non-allowed account is refused
+    title: From claude.ai (and Claude Desktop), sign in, publish, replace, list and take down a page, publish from an allowed URL and be refused for another host; a non-allowed account is refused
     why: claude.ai's OAuth client (dynamic registration, callback URL) is only testable against a real public server
   - id: ma3-claude-code
     title: From Claude Code, sign in with OAuth, then with an API token, and publish a large page through create_page_upload
@@ -1019,8 +1170,8 @@ verify_after_merge:
   - bandit -q -c pyproject.toml -r src
 final_checks:
   - docs/publish-pages-plan.md and docs/publish-pages-plan-manual-steps.html are deleted and nothing links to them (grep -rn "publish-pages-plan" . --exclude-dir=.git returns nothing)
-  - ADRs 0011 to 0019 exist, each is Accepted, and each is in docs/adr/README.md's index
-  - CHANGELOG.md has [Unreleased] entries for the tools, sign-in, uploads and deployment, and no version heading
+  - ADRs 0011 to 0020 exist, each is Accepted, and each is in docs/adr/README.md's index
+  - CHANGELOG.md has [Unreleased] entries for the tools, sign-in, uploads, fetching by URL and deployment, and no version heading
   - echo appears nowhere in src/ or tests/ (grep -rn '"echo"' src tests returns nothing)
   - build.yml dispatched against feature/publish-pages is green, and the run is linked in the PR
 phases:
@@ -1038,7 +1189,7 @@ phases:
       - deploy/config.example.toml
     brief: |
       Read docs/publish-pages-plan.md sections D1, D2, D3, D4 first; they are the spec. Do not edit CHANGELOG.md or
-      pyproject.toml (p3 and p9 own them).
+      pyproject.toml (p3 and p10 own them).
       1. Create src/html_artifact_deploy/pages.py exactly as D3 (module docstring, `from __future__ import annotations`).
       2. Create src/html_artifact_deploy/config.py exactly as D2: the constants (DEFAULT_SECRET_ENV with its nosec
          comment), the four dataclasses, ConfigError, resolve_config_path, load_config (every check in the D2 table, in
@@ -1174,7 +1325,7 @@ phases:
            server_info.
       6. README.md: replace the tool table rows with publish_page, list_pages, unpublish_page, server_info (one line each);
          change the Claude Code and Claude Desktop examples to pass `--config ~/html-artifact-deploy.toml`. Leave the rest
-         for p8.
+         for p9.
       7. Full suite at 100% coverage. Then dispatch build.yml against this phase branch (steward table: "The built wheel,
          and its packaged smoke test") and put the run URL and result in the PHASE-REPORT. A red packaged job is this
          phase's to fix.
@@ -1412,9 +1563,83 @@ phases:
       - python3 scripts/mypy_strict_modules.py --list | grep -c "src/html_artifact_deploy/" prints 13
       - ruff check . && ruff format --check . && python3 scripts/mypy_strict_modules.py && bandit -q -c pyproject.toml -r src pass
 
-  - id: p8-deployment-docs
+  - id: p8-url-fetch
+    title: Publish from an allowlisted https address (publish_page_from_url)
+    depends_on: [p7-uploads]
+    complexity: M
+    touches:
+      - src/html_artifact_deploy/fetch_client.py
+      - src/html_artifact_deploy/config.py
+      - src/html_artifact_deploy/server.py
+      - src/html_artifact_deploy/__main__.py
+      - src/html_artifact_deploy/http_app.py
+      - deploy/config.example.toml
+      - pyproject.toml
+      - scripts/check_coverage_floor.py
+      - tests/unit/test_fetch_client.py
+      - tests/unit/test_config.py
+      - tests/unit/test_server.py
+      - tests/unit/test_main.py
+      - tests/unit/test_http_app.py
+    brief: |
+      Read docs/publish-pages-plan.md sections D2 (the [fetch] section, FetchConfig, HOST_RE and the rows marked (p8)),
+      D7 (check_can_publish), D8 and D16 first; they are the spec. Do not edit CHANGELOG.md.
+      1. config.py: add FetchConfig, Config.fetch, HOST_RE, `fetch` to the known sections, and the four (p8) checks of the
+         D2 table, after the [auth] checks, in that order and with those messages.
+      2. Create src/html_artifact_deploy/fetch_client.py exactly as D16 (constants, FetchClientError, FetchClient with
+         check_url, fetch, _fetch_blocking, and the private _AllowlistRedirectHandler).
+      3. server.py: add `fetcher: FetchClient | None = None` to AppContext; register publish_page_from_url with D16's
+         docstring and annotations only when app.fetcher is not None, with D16's flow; insert D8's p8 sentence into
+         publish_page's docstring.
+      4. __main__.py (stdio) and http_app.py: build `FetchClient(config.fetch, config.pages.max_bytes)` when config.fetch is
+         set and pass it as AppContext.fetcher.
+      5. deploy/config.example.toml: add the [fetch] section from D2 with a comment that removing it turns the tool off.
+      6. pyproject.toml: add "html_artifact_deploy.fetch_client" to the mypy override's module list.
+         scripts/check_coverage_floor.py: add fetch_client.py at 100.0 with the comment "# which hosts the server
+         downloads from (SSRF boundary)".
+      7. Tests (marker `unit`). Network is always faked: pass `resolve=` returning fixed getaddrinfo tuples and
+         `handlers=[FakeHTTPS(...)]`, a urllib.request.HTTPSHandler subclass whose https_open returns
+         `urllib.response.addinfourl(io.BytesIO(body), headers, req.full_url, code)` with `resp.msg = "OK"` set, from a
+         dict of url → (code, headers, body), recording every request it sees.
+         - tests/unit/test_fetch_client.py: success returns the bytes and sends USER_AGENT and no Authorization or Cookie
+           header; every check_url row with the exact message: http scheme, `https://user:pass@h/`, `https://@h/`, a tab
+           or newline inside the URL, `https://[::1/`, port `:abc`, port 8443, `https://h:443/` accepted, no host, a host
+           not listed, a getaddrinfo OSError, resolved 10.0.0.5, 127.0.0.1, 169.254.169.254, ::1 (an IPv6 tuple
+           `(AF_INET6, SOCK_STREAM, 6, "", ("::1", 443, 0, 0))`), fe80::1%eth0 and 64:ff9b::a00:1 each refused, a public
+           93.184.216.34 accepted; an HTTPS_PROXY set in the environment is ignored (monkeypatch.setenv it; the fake still
+           receives the request); a redirect to another allowed host is followed; a redirect to a non-allowed host and to
+           http:// raise the "redirected to" message and the fake never sees the second request; `Location: https:///x`
+           gives "redirected to an invalid address"; a malformed `Location: https://[::1/` gives "Could not fetch the page
+           from"; a `file:///etc/passwd` Location and an A→B→A loop each give "answered HTTP 302."; three redirects
+           succeed with redirect_request seeing counts 0, 1, 2, and a fourth raises "redirected too many times."; a 404 →
+           "answered HTTP 404." and its body is closed; an OSError from the fake → "Could not fetch the page from";
+           Content-Length over max_bytes is refused before reading (the fake's body reports that read() was not called);
+           a non-numeric Content-Length is ignored; a body one byte over max_bytes without Content-Length is refused and
+           exactly max_bytes is accepted; the log line names the host and not the path or query (caplog with a
+           `?X-Amz-Signature=secret` URL); fetch() runs through asyncio.to_thread (await it in an async test).
+         - tests/unit/test_config.py: one parametrized case per (p8) row; a valid [fetch] loads with lowercased hosts and
+           the default timeout 20; the example file still loads.
+         - tests/unit/test_server.py: without a fetcher the tool is absent; with a FetchClient over the fake: the tool is
+           listed with D16's annotations; publishing from a URL writes the file and returns the publish_page fields;
+           page_id replacement keeps the url; a bad title and another owner's page_id fail without any request reaching
+           the fake; a FetchClientError message comes back as the tool error; a fetched body that is not UTF-8 gives
+           D7's message.
+         - tests/unit/test_main.py and tests/unit/test_http_app.py: with [fetch] in the config, the built AppContext has a
+           fetcher (stdio: capture build_server's argument via monkeypatch; HTTP: tools/list includes
+           publish_page_from_url).
+      8. Full suite at 100% coverage.
+      Stop with status=blocked if urllib does not call redirect_request for a 302 from the fake handler, or if
+      req.redirect_dict does not count the hops as D16 assumes (see Risks).
+    acceptance:
+      - python3 -m pytest tests/unit/test_fetch_client.py tests/unit/test_config.py tests/unit/test_server.py tests/unit/test_main.py tests/unit/test_http_app.py -q passes
+      - python3 -m pytest -q --cov=src/html_artifact_deploy --cov-branch --cov-report=json:coverage.json && python3 scripts/check_coverage_floor.py coverage.json passes
+      - python3 scripts/mypy_strict_modules.py --list | grep -c "src/html_artifact_deploy/" prints 14
+      - grep -c "nosec" src/html_artifact_deploy/fetch_client.py prints 0
+      - ruff check . && ruff format --check . && python3 scripts/mypy_strict_modules.py && bandit -q -c pyproject.toml -r src pass
+
+  - id: p9-deployment-docs
     title: systemd unit, Caddyfile, deployment and configuration guides, README
-    depends_on: [p6-http-transport]
+    depends_on: [p8-url-fetch]
     complexity: M
     touches:
       - deploy/html-artifact-deploy.service
@@ -1425,24 +1650,29 @@ phases:
       - README.md
       - tests/unit/test_deploy_files.py
     brief: |
-      Read docs/publish-pages-plan.md sections D2, D11, D12, D13, D14, D15 first; they are the spec. Do not edit
+      Read docs/publish-pages-plan.md sections D2, D11, D12, D13, D14, D15, D16 first; they are the spec. Do not edit
       CHANGELOG.md. Standing docs describe today's behaviour only, with no project history (ADR 0008); where a "why" is
-      needed, cite ADRs 0011–0019 by number (p9 writes them; their numbers are fixed by the plan's ADRs section).
+      needed, cite ADRs 0011–0020 by number (p10 writes them; their numbers are fixed by the plan's ADRs section).
       1. deploy/html-artifact-deploy.service and deploy/Caddyfile.example exactly as D14.
       2. docs/deployment.md: the D14 walkthrough, numbered, every command in a code block. Google steps link
          https://console.cloud.google.com/auth/branding, https://console.cloud.google.com/auth/audience (choose Internal)
          and https://console.cloud.google.com/auth/clients/create. Commands that touch state.dir run as the service user
-         exactly as D13 says. It covers create_page_upload's size limit, and that uploads need a client that can make an
-         HTTP PUT (Claude Code).
+         exactly as D13 says. A section "Large pages" explains the three ways a page arrives and their limits: as the
+         html argument (limited by what the model can write in one tool call; pages.max_bytes on the server), through
+         create_page_upload (needs a client that can make an HTTP PUT, such as Claude Code; pages.max_bytes, 15 minutes,
+         10 open uploads per person), and through publish_page_from_url (only hosts in fetch.allowed_hosts; https only;
+         pages.max_bytes; fetch.timeout_seconds; why the list exists, citing ADR 0020).
       3. docs/configuration.md: one table per section of D2 (key, type, required/default, meaning), the environment
          variables (HTML_ARTIFACT_DEPLOY_CONFIG and the client-secret variable) and the D13 commands.
       4. docs/README.md: add deployment.md and configuration.md under "Using HTML Artifact Deploy".
       5. README.md: rewrite "Connect a client" as D15 (four subsections), add a short "Run your own server" paragraph
-         linking docs/deployment.md, and add a create_page_upload row to the tool table ("HTTP only").
+         linking docs/deployment.md, and add rows to the tool table for create_page_upload ("HTTP only") and
+         publish_page_from_url ("only when [fetch] is configured").
       6. tests/unit/test_deploy_files.py (marker `unit`): every key in deploy/config.example.toml appears in
          docs/configuration.md (parse the TOML, then search the doc text for each `key`); the Caddyfile's pages site
          contains the exact Content-Security-Policy value from D14 and no `browse`; the systemd unit contains ExecStart with
-         `serve-http`, EnvironmentFile, ReadWritePaths=/srv/pages and NoNewPrivileges=yes.
+         `serve-http`, EnvironmentFile, ReadWritePaths=/srv/pages and NoNewPrivileges=yes; docs/deployment.md contains
+         the strings "create_page_upload", "publish_page_from_url" and "fetch.allowed_hosts".
       7. python3 -m pytest tests/unit/test_no_project_history.py -q must pass.
       Stop with status=blocked if a D13 command or a D2 key the docs must describe does not exist in the code as merged.
     acceptance:
@@ -1451,9 +1681,9 @@ phases:
       - grep -c "docs/deployment.md" README.md prints at least 1
       - python3 -m pytest -q passes
 
-  - id: p9-adrs-and-retire
-    title: ADRs 0011–0019, changelog, reference-doc touch-ups, delete the plan
-    depends_on: [p7-uploads, p8-deployment-docs]
+  - id: p10-adrs-and-retire
+    title: ADRs 0011–0020, changelog, reference-doc touch-ups, delete the plan
+    depends_on: [p9-deployment-docs]
     complexity: M
     touches:
       - docs/adr/0011-a-standalone-server-that-writes-into-the-web-servers-folder.md
@@ -1465,6 +1695,7 @@ phases:
       - docs/adr/0017-all-state-is-one-sqlite-file.md
       - docs/adr/0018-large-pages-arrive-through-one-time-upload-urls.md
       - docs/adr/0019-streamable-http-is-stateless-and-starlette-and-uvicorn-are-declared.md
+      - docs/adr/0020-pages-are-fetched-only-from-allowlisted-https-hosts.md
       - docs/adr/README.md
       - docs/live-qa.md
       - docs/testing-policy.md
@@ -1472,29 +1703,29 @@ phases:
       - docs/publish-pages-plan.md
       - docs/publish-pages-plan-manual-steps.html
     brief: |
-      1. Write ADRs 0011–0019 from the plan's "ADRs" list, with the file names in `touches` and docs/adr/README.md's
+      1. Write ADRs 0011–0020 from the plan's "ADRs" list, with the file names in `touches` and docs/adr/README.md's
          template. Context and Decision come from the matching D-section; "Alternatives considered" from the plan's
          "Rejected alternatives" bullets for that decision; Verification names the enforcing files and tests (for example
          0012 → config.py's host check and tests/unit/test_config.py, deploy/Caddyfile.example and
          tests/unit/test_deploy_files.py). Status `Accepted — <today's date>.` Related: source files, and ADRs 0003,
          0007 and 0010 where relevant; never the plan document.
-      2. docs/adr/README.md: add the nine rows to the index.
+      2. docs/adr/README.md: add the ten rows to the index.
       3. docs/live-qa.md: a short section saying the google_openid_configuration check needs no QA account or
          credentials, so it can run anywhere (it still runs weekly on the runner with the others).
       4. docs/testing-policy.md: in "Layer 5", one sentence naming google_openid_configuration as the only live check and
          what it guards (Google's authorization and token endpoints).
       5. CHANGELOG.md under ## [Unreleased]: ### Added, replacing the skeleton line: the publish_page, list_pages and
          unpublish_page tools; Google Workspace sign-in for claude.ai, Claude Desktop and Claude Code over Streamable
-         HTTP; API tokens; create_page_upload; stdio with --config; the deploy/ examples and the deployment and
+         HTTP; API tokens; create_page_upload; publish_page_from_url for allowlisted hosts; stdio with --config; the deploy/ examples and the deployment and
          configuration guides. ### Removed: the placeholder echo tool.
       6. git rm docs/publish-pages-plan.md docs/publish-pages-plan-manual-steps.html; grep -rn "publish-pages-plan" .
          --exclude-dir=.git must return nothing.
       7. Dispatch build.yml against this phase branch and report the run.
-      Stop with status=blocked if an ADR number 0011–0019 is already taken on main when you start (renumbering is then
-      the orchestrator's call, since p8's docs cite the numbers).
+      Stop with status=blocked if an ADR number 0011–0020 is already taken on main when you start (renumbering is then
+      the orchestrator's call, since p9's docs cite the numbers).
     acceptance:
-      - ls docs/adr/00{11,12,13,14,15,16,17,18,19}-*.md lists nine files
-      - grep -cE "^\| \[00(1[1-9])\]" docs/adr/README.md prints 9
+      - ls docs/adr/00{11,12,13,14,15,16,17,18,19,20}-*.md lists ten files
+      - grep -cE "^\| \[00(1[1-9]|20)\]" docs/adr/README.md prints 10
       - test ! -e docs/publish-pages-plan.md && test ! -e docs/publish-pages-plan-manual-steps.html
       - grep -rn "publish-pages-plan" . --exclude-dir=.git returns nothing
       - python3 -m pytest -q passes (including test_no_project_history)
