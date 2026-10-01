@@ -80,6 +80,7 @@ def is_allowed_redirect_uri(uri: str, allowlist: Sequence[str]) -> bool:
 def auth_settings(http: HttpConfig) -> AuthSettings:
     # Validated from plain strings so the issuer keeps its exact spelling, with no trailing slash
     # added: clients compare the issuer as a string (RFC 8414).
+    bind_tokens_to_resource = True
     return AuthSettings.model_validate(
         {
             "issuer_url": http.public_url,
@@ -90,7 +91,7 @@ def auth_settings(http: HttpConfig) -> AuthSettings:
             ),
             "revocation_options": RevocationOptions(enabled=True),
             "required_scopes": [SCOPE],
-            "validate_token_resource": True,  # nosec B105  # a settings flag, not a secret
+            "validate_token_resource": bind_tokens_to_resource,
         }
     )
 

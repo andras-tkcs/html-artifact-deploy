@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import io
 import logging
 import socket
@@ -50,19 +51,22 @@ def public(host: str, port: int, type: int = 0) -> list[tuple[Any, ...]]:
 
 
 class Body(io.BytesIO):
-    def __init__(self, data: bytes) -> None:
+    def __init__(self, data: bytes, error: Exception | None = None) -> None:
         super().__init__(data)
         self.read_called = False
+        self.error = error
 
     def read(self, size: int | None = -1) -> bytes:
         self.read_called = True
+        if self.error is not None:
+            raise self.error
         return super().read(size)
 
 
 class FakeHTTPS(urllib.request.HTTPSHandler):
     """Answers from url -> (code, headers, body); records every request it sees."""
 
-    def __init__(self, routes: dict[str, tuple[int, dict[str, str], bytes] | Exception]) -> None:
+    def __init__(self, routes: dict[str, tuple[int, dict[str, str], bytes | Exception] | Exception]) -> None:
         super().__init__()
         self.routes = routes
         self.requests: list[urllib.request.Request] = []
@@ -77,7 +81,7 @@ class FakeHTTPS(urllib.request.HTTPSHandler):
         headers = Message()
         for name, value in raw_headers.items():
             headers[name] = value
-        stream = Body(body)
+        stream = Body(b"", body) if isinstance(body, Exception) else Body(body)
         self.bodies.append(stream)
         resp = urllib.response.addinfourl(stream, headers, req.full_url, code)
         resp.msg = "OK"
@@ -267,6 +271,16 @@ class TestFailures:
         with pytest.raises(FetchClientError) as excinfo:
             client(fake)._fetch_blocking(URL)
         assert str(excinfo.value) == "Could not fetch the page from raw.example.com."
+
+    @pytest.mark.parametrize(
+        "error", [TimeoutError("slow"), ConnectionResetError("reset"), http.client.IncompleteRead(b"ab")]
+    )
+    def test_error_while_reading_the_body(self, error: Exception) -> None:
+        fake = FakeHTTPS({URL: (200, {}, error)})
+        with pytest.raises(FetchClientError) as excinfo:
+            client(fake)._fetch_blocking(URL)
+        assert str(excinfo.value) == "Could not fetch the page from raw.example.com."
+        assert fake.bodies[0].closed
 
     def test_content_length_over_the_limit_is_refused_before_reading(self) -> None:
         fake = FakeHTTPS({URL: ok(b"x" * 10, **{"Content-Length": "1001"})})
