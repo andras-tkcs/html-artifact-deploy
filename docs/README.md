@@ -3,6 +3,8 @@
 ## Using HTML Artifact Deploy
 
 - [`../README.md`](../README.md) — install, connect a client, the tool list.
+- [`deployment.md`](deployment.md) — set up your own server: Google sign-in, systemd, Caddy, large pages, expiry.
+- [`configuration.md`](configuration.md) — every configuration key, the environment variables and the commands.
 
 ## Contributing
 
