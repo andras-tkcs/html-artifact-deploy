@@ -10,6 +10,12 @@ one. Seed it with the objects the checks read, and write their identifiers into
 `tests/fixtures/qa_environment.yaml` on the QA machine only; that file is git-ignored by name in the
 runner's checkout and never committed.
 
+## The check that needs no account
+
+The only registered check, `google_openid_configuration`, reads Google's public OpenID discovery
+document. It needs no QA account and no credentials, so `python3 scripts/live_check.py --check` can
+run on any machine with internet access. It still runs weekly on the runner with the others.
+
 ## The self-hosted runner
 
 Live credentials live only on a self-hosted runner the project controls (ADR 0007):

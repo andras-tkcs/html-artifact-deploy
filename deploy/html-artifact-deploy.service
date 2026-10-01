@@ -1,0 +1,24 @@
+[Unit]
+Description=HTML Artifact Deploy (MCP server over Streamable HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=html-artifact-deploy
+Group=html-artifact-deploy
+StateDirectory=html-artifact-deploy
+StateDirectoryMode=0700
+ReadWritePaths=/srv/pages
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0022
+EnvironmentFile=/etc/html-artifact-deploy/secrets.env
+ExecStart=/opt/html-artifact-deploy/bin/html-artifact-deploy --config /etc/html-artifact-deploy/config.toml serve-http
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

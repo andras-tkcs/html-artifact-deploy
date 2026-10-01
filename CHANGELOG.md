@@ -34,6 +34,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- The first MCP server skeleton: `echo` and `server_info` over stdio.
+- The `publish_page`, `list_pages` and `unpublish_page` tools: publish a single-file HTML page and
+  get its link, replace it at the same link, list your pages and take one down.
+- Google Workspace sign-in for claude.ai, Claude Desktop and Claude Code over Streamable HTTP, and
+  API tokens for Claude Code (`token create`, `token list`, `token revoke`).
+- `create_page_upload`: a one-time upload URL for large pages.
+- `publish_page_from_url`: the server downloads a page from an https address on a host the
+  administrator allows.
+- Page links are random ids only; a page's title never appears in its address.
+- Page expiry: 90 days by default, at most 365; `extend_page_expiry` changes it, and the
+  `purge-expired` command and timer delete expired pages.
+- stdio with `--config`, for running the server locally.
+- The `deploy/` examples (web server, systemd units, configuration) and the deployment and
+  configuration guides.
+
+### Removed
+
+- The placeholder `echo` tool.
 
 [Unreleased]: https://github.com/andras-tkcs/html-artifact-deploy/commits/main

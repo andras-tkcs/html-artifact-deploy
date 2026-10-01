@@ -33,6 +33,20 @@ OVERALL_FLOOR = 100.0
 MODULE_FLOORS: dict[str, float] = {
     # The tool surface every MCP client sees.
     "src/html_artifact_deploy/server.py": 100.0,
+    # The configuration's fail-closed checks.
+    "src/html_artifact_deploy/config.py": 100.0,
+    # Writes into the published folder.
+    "src/html_artifact_deploy/storage.py": 100.0,
+    # Stores and checks every bearer token and sign-in secret.
+    "src/html_artifact_deploy/token_store.py": 100.0,
+    # Decides who may sign in and which redirect URIs receive a code.
+    "src/html_artifact_deploy/oauth_provider.py": 100.0,
+    # Wires authentication, host checks and body limits around the tools.
+    "src/html_artifact_deploy/http_app.py": 100.0,
+    # Accepts file bodies from callers who hold only a one-time URL.
+    "src/html_artifact_deploy/uploads.py": 100.0,
+    # which hosts the server downloads from (SSRF boundary)
+    "src/html_artifact_deploy/fetch_client.py": 100.0,
 }
 
 
