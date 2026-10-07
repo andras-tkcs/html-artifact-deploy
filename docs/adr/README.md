@@ -103,8 +103,7 @@ Issues, PRs, commits, other ADRs. For a deleted source document: `git show <sha>
 
 ## Index
 
-The first nine were inherited from the template this repository started from; each still applies
-until a later ADR supersedes it.
+Each ADR applies until a later one supersedes it.
 
 | # | Decision | Status |
 |---|---|---|
@@ -118,3 +117,14 @@ until a later ADR supersedes it.
 | [0008](0008-code-and-docs-carry-no-project-history.md) | Code and standing docs carry no project history | Accepted |
 | [0009](0009-pypi-publishing-uses-trusted-publishing-only.md) | PyPI publishing uses OIDC trusted publishing only | Accepted |
 | [0010](0010-the-server-runs-on-headless-linux-only.md) | The server runs on headless Linux only; CI tests no other OS | Accepted |
+| [0011](a-standalone-server-that-writes-into-the-web-servers-folder.md) | A standalone server that writes pages into the web server's folder; it never serves them | Accepted |
+| [0012](pages-are-served-from-a-separate-sandboxed-host-name.md) | Pages are served from a separate, sandboxed host name | Accepted |
+| [0013](a-page-link-is-only-a-random-id-and-ownership-is-an-index.md) | A page's link is only a random id; ownership is an index | Accepted |
+| [0014](the-server-is-its-own-oauth-server-and-google-only-proves-identity.md) | The server is its own OAuth server; Google only proves identity | Accepted |
+| [0015](client-registration-accepts-only-allowlisted-redirect-uris.md) | Client registration accepts only allowlisted redirect URIs | Accepted |
+| [0016](google-id-tokens-are-trusted-by-tls-not-by-signature.md) | Google ID tokens are trusted by TLS, not by signature | Accepted |
+| [0017](all-state-is-one-sqlite-file.md) | All state is one SQLite file | Accepted |
+| [0018](large-pages-arrive-through-one-time-upload-urls.md) | Large pages arrive through one-time upload URLs | Accepted |
+| [0019](streamable-http-is-stateless-and-starlette-and-uvicorn-are-declared.md) | Streamable HTTP is stateless; Starlette and uvicorn are declared | Accepted |
+| [0020](pages-are-fetched-only-from-allowlisted-https-hosts.md) | Pages are fetched only from allowlisted https hosts | Accepted |
+| [0021](every-page-expires-and-its-owner-can-extend-it.md) | Every page expires, and its owner can extend it | Accepted |

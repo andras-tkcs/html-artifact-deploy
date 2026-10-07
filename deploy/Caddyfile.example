@@ -1,0 +1,15 @@
+publish.example.com {
+    reverse_proxy 127.0.0.1:8765
+}
+
+pages.example.com {
+    root * /srv/pages
+    file_server
+    header {
+        Content-Security-Policy "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-forms allow-modals allow-downloads"
+        X-Content-Type-Options nosniff
+        Referrer-Policy no-referrer
+        X-Robots-Tag "noindex, nofollow"
+        Cache-Control no-cache
+    }
+}

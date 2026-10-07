@@ -40,9 +40,19 @@ class TestInstalledWheel:
         ).stdout.strip()
         assert not Path(out).resolve().is_relative_to(REPO_SRC)
 
-    async def test_entry_point_lists_tools_over_stdio(self) -> None:
+    async def test_entry_point_lists_tools_over_stdio(self, tmp_path: Path) -> None:
+        pages = tmp_path / "pages"
+        pages.mkdir()
+        config = tmp_path / "config.toml"
+        config.write_text(
+            f'[pages]\nroot = "{pages}"\npublic_base_url = "https://pages.example.com"\n'
+            f'[state]\ndir = "{tmp_path / "state"}"\n',
+            encoding="utf-8",
+        )
         params = StdioServerParameters(
-            command=_python(), args=["-m", "html_artifact_deploy"], cwd=os.path.expanduser("~")
+            command=_python(),
+            args=["-m", "html_artifact_deploy", "--config", str(config)],
+            cwd=os.path.expanduser("~"),
         )
         async with Client(params, read_timeout_seconds=30) as client:
             tools = (await client.list_tools()).tools

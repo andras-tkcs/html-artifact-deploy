@@ -1,0 +1,53 @@
+# Example configuration for html-artifact-deploy. Copy it to /etc/html-artifact-deploy/config.toml
+# (or pass --config, or set HTML_ARTIFACT_DEPLOY_CONFIG) and change the values.
+
+[pages]
+# Required: the absolute path of the folder the web server publishes; each page is <root>/<page id>/index.html.
+root = "/srv/pages"
+# Required: the https:// address at which the web server publishes that folder; it must not share a host name with [http].
+public_base_url = "https://pages.example.com"
+# Optional: the largest page in bytes, 1 to 50000000 (default 16000000).
+max_bytes = 16000000
+# Optional: days a new page lives unless its publisher asks for another number, 1 to max_expiry_days (default 90).
+default_expiry_days = 90
+# Optional: the longest a page may live, in days, 1 to 365 (default 365).
+max_expiry_days = 365
+
+[state]
+# Required: the absolute path of the folder this server keeps its database in.
+dir = "/var/lib/html-artifact-deploy"
+
+[stdio]
+# Optional: the name pages published over stdio are owned by (default "local").
+user = "local"
+
+# Required for serve-http; omit for stdio only.
+[http]
+# Required: the https:// address of this server, as clients reach it.
+public_url = "https://publish.example.com"
+# Optional: the address to listen on (default "127.0.0.1").
+listen_host = "127.0.0.1"
+# Optional: the port to listen on, 1 to 65535 (default 8765).
+listen_port = 8765
+
+# Required for serve-http; omit for stdio only.
+[auth]
+# Required: the Client ID of your Google OAuth client, ending in .apps.googleusercontent.com.
+google_client_id = "1234-abc.apps.googleusercontent.com"
+# Optional: the NAME of the environment variable that holds the Google client secret (the secret is never kept in this file).
+google_client_secret_env = "HTML_ARTIFACT_DEPLOY_GOOGLE_CLIENT_SECRET"
+# Required unless allowed_emails is given: Google Workspace domains whose accounts may sign in.
+allowed_domains = ["example.com"]
+# Required unless allowed_domains is given: individual e-mail addresses that may sign in.
+allowed_emails = []
+# Optional: the https:// redirect addresses OAuth clients may use (default: claude.ai and claude.com).
+redirect_uri_allowlist = ["https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback"]
+
+# Optional: lets clients publish a page by its https:// address (the publish_page_from_url tool). Remove this whole
+# section to turn the tool off.
+[fetch]
+# Required: the host names pages may be fetched from. Plain names only: no addresses, ports or wildcards, and not
+# this server's own host names.
+allowed_hosts = ["raw.githubusercontent.com"]
+# Optional: seconds to wait for each network operation, 1 to 120 (default 20).
+timeout_seconds = 20

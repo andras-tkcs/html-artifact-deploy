@@ -1,0 +1,198 @@
+"""Publish, list and take down pages: the business rules behind the MCP tools.
+
+Every method is a coroutine; the blocking store and index calls run through `asyncio.to_thread`.
+A `PageError`'s message is written for the caller and goes to the tool result verbatim.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hashlib
+import logging
+from dataclasses import dataclass, replace
+
+from .config import PagesConfig
+from .page_index import PageIdTakenError, PageIndex, PageRecord
+from .pages import clean_title, new_page_id, page_url
+from .storage import PageExistsError, PageStore, StorageError
+
+logger = logging.getLogger(__name__)
+
+NEW_ID_ATTEMPTS = 3
+SECONDS_PER_DAY = 86400
+MAX_LIST_LIMIT = 200
+PURGE_BATCH = 50
+
+
+class PageError(Exception):
+    """A problem the caller can act on; its message goes to the caller verbatim."""
+
+
+@dataclass(frozen=True)
+class PublishResult:
+    record: PageRecord
+    url: str
+    created: bool
+
+
+class PageService:
+    def __init__(self, config: PagesConfig, store: PageStore, index: PageIndex) -> None:
+        self._config = config
+        self._store = store
+        self._index = index
+
+    @property
+    def config(self) -> PagesConfig:
+        return self._config
+
+    def _now(self) -> int:
+        return int(self._index.clock())
+
+    def url_for(self, record: PageRecord) -> str:
+        return page_url(self._config.public_base_url, record.page_id)
+
+    @staticmethod
+    def _no_such_page(page_id: str) -> PageError:
+        return PageError(
+            f"No page with page_id {page_id!r} was published by you, or it has expired. "
+            "Call list_pages to see your pages."
+        )
+
+    @staticmethod
+    def _clean_title(title: str) -> str:
+        try:
+            return clean_title(title)
+        except ValueError as error:
+            raise PageError("title must be 1 to 200 characters.") from error
+
+    def _check_expires_in_days(self, expires_in_days: int) -> None:
+        if expires_in_days != 0 and not 1 <= expires_in_days <= self._config.max_expiry_days:
+            raise PageError(
+                f"expires_in_days must be from 1 to {self._config.max_expiry_days}, "
+                f"or 0 for the default of {self._config.default_expiry_days}."
+            )
+
+    async def check_can_publish(self, owner: str, title: str, page_id: str, expires_in_days: int = 0) -> None:
+        """Run the checks that need no page content: the title, the expiry, and ownership of `page_id`."""
+        self._clean_title(title)
+        self._check_expires_in_days(expires_in_days)
+        if page_id and await asyncio.to_thread(self._index.get, owner, page_id) is None:
+            raise self._no_such_page(page_id)
+
+    async def publish(
+        self, owner: str, title: str, data: bytes, page_id: str = "", expires_in_days: int = 0
+    ) -> PublishResult:
+        title = self._clean_title(title)
+        self._check_expires_in_days(expires_in_days)
+        if len(data) == 0:
+            raise PageError("The page is empty.")
+        if len(data) > self._config.max_bytes:
+            raise PageError(f"The page is {len(data):,} bytes, over the {self._config.max_bytes:,}-byte limit.")
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise PageError("The page is not UTF-8 text, so it is not an HTML page.") from error
+
+        sha256 = hashlib.sha256(data).hexdigest()
+        now = self._now()
+        try:
+            if page_id:
+                record = await self._replace(owner, title, data, sha256, page_id, now, expires_in_days)
+                created = False
+            else:
+                record = await self._create(owner, title, data, sha256, now, expires_in_days)
+                created = True
+        except StorageError as error:
+            raise PageError(
+                "The page could not be saved on the server. Try again later, or ask whoever runs "
+                "html-artifact-deploy to check its log."
+            ) from error
+        logger.info("published page_id=%s owner=%s bytes=%d replaced=%s", record.page_id, owner, len(data), not created)
+        try:
+            await self.purge_expired()
+        except Exception:
+            logger.warning("expired-page purge failed", exc_info=True)
+        return PublishResult(record, self.url_for(record), created)
+
+    async def _replace(
+        self, owner: str, title: str, data: bytes, sha256: str, page_id: str, now: int, expires_in_days: int
+    ) -> PageRecord:
+        existing = await asyncio.to_thread(self._index.get, owner, page_id)
+        if existing is None:
+            raise self._no_such_page(page_id)
+        await asyncio.to_thread(self._store.write_page, page_id, data, new=False)
+        expires_at = now + expires_in_days * SECONDS_PER_DAY if expires_in_days else existing.expires_at
+        record = replace(existing, title=title, bytes=len(data), sha256=sha256, updated_at=now, expires_at=expires_at)
+        if not await asyncio.to_thread(self._index.update_live, record):
+            raise self._no_such_page(page_id)
+        return record
+
+    async def _create(
+        self, owner: str, title: str, data: bytes, sha256: str, now: int, expires_in_days: int
+    ) -> PageRecord:
+        expires_at = now + (expires_in_days or self._config.default_expiry_days) * SECONDS_PER_DAY
+        for _ in range(NEW_ID_ATTEMPTS):
+            page_id = new_page_id()
+            if await asyncio.to_thread(self._index.exists, page_id):
+                continue
+            try:
+                await asyncio.to_thread(self._store.write_page, page_id, data, new=True)
+            except PageExistsError:
+                continue
+            record = PageRecord(page_id, owner, title, len(data), sha256, now, now, expires_at)
+            try:
+                await asyncio.to_thread(self._index.insert, record)
+            except PageIdTakenError as error:
+                with contextlib.suppress(StorageError):
+                    await asyncio.to_thread(self._store.delete_page, page_id)
+                raise PageError("Could not allocate a new page id. Try again.") from error
+            return record
+        raise PageError("Could not allocate a new page id. Try again.")
+
+    async def list_pages(self, owner: str, limit: int) -> list[PageRecord]:
+        limit = max(1, min(MAX_LIST_LIMIT, limit))
+        return await asyncio.to_thread(self._index.list, owner, limit)
+
+    async def unpublish(self, owner: str, page_id: str) -> PageRecord:
+        record = await asyncio.to_thread(self._index.get_any, owner, page_id)
+        if record is None:
+            raise self._no_such_page(page_id)
+        try:
+            await asyncio.to_thread(self._store.delete_page, page_id)
+        except StorageError as error:
+            raise PageError(
+                "The page could not be removed from the server. Try again later, or ask whoever runs "
+                "html-artifact-deploy to check its log."
+            ) from error
+        await asyncio.to_thread(self._index.remove, owner, page_id)
+        logger.info("unpublished page_id=%s owner=%s", page_id, owner)
+        return record
+
+    async def extend(self, owner: str, page_id: str, days: int) -> PageRecord:
+        if not 1 <= days <= self._config.max_expiry_days:
+            raise PageError(f"days must be from 1 to {self._config.max_expiry_days}.")
+        existing = await asyncio.to_thread(self._index.get, owner, page_id)
+        if existing is None:
+            raise self._no_such_page(page_id)
+        expires_at = self._now() + days * SECONDS_PER_DAY
+        if not await asyncio.to_thread(self._index.set_expiry, owner, page_id, expires_at):
+            raise self._no_such_page(page_id)
+        logger.info("expiry set page_id=%s owner=%s days=%d", page_id, owner, days)
+        return replace(existing, expires_at=expires_at)
+
+    async def purge_expired(self, limit: int = PURGE_BATCH) -> int:
+        """Delete the folders and rows of expired pages; return how many pages were deleted."""
+        purged = 0
+        for record in await asyncio.to_thread(self._index.expired, limit):
+            try:
+                await asyncio.to_thread(self._store.delete_page, record.page_id)
+            except StorageError as exc:
+                logger.warning("could not delete expired page_id=%s: %s", record.page_id, exc)
+                await asyncio.to_thread(self._index.requeue_expired, record.page_id)
+                continue
+            if await asyncio.to_thread(self._index.remove_expired, record.page_id):
+                purged += 1
+        if purged:
+            logger.info("purged %d expired pages", purged)
+        return purged
